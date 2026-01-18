@@ -2,7 +2,6 @@
 Distributed Key-Value Store - Main FastAPI Application
 
 This is the entry point for our distributed KV store.
-In Phase 1, we're building a single-node version with basic CRUD operations.
 """
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
