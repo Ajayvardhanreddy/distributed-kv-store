@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  kv-node:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount for live code reload during development
+      - ./app:/app/app
+      # Mount for persistent WAL storage
+      - ./data:/app/data
+    environment:
+      - NODE_ID=node-1
+      - LOG_LEVEL=info
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
