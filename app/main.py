@@ -5,8 +5,11 @@ This is the entry point for our distributed KV store.
 """
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import logging
 import os
+
+from app.storage.engine import StorageEngine
 
 # Configure logging
 logging.basicConfig(
@@ -15,14 +18,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Global storage engine instance
+storage: StorageEngine = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Lifecycle manager for FastAPI application.
+    
+    Handles startup (WAL replay) and shutdown (graceful close) events.
+    """
+    global storage
+    
+    # Startup: Initialize storage and replay WAL
+    wal_path = os.getenv("WAL_PATH", "data/node.wal")
+    storage = StorageEngine(wal_path)
+    await storage.initialize()
+    logger.info(f"✅ Storage engine ready with {await storage.size()} keys")
+    
+    yield
+    
+    # Shutdown: Close storage gracefully
+    await storage.close()
+    logger.info("✅ Storage engine closed")
+
+
 app = FastAPI(
     title="Distributed Key-Value Store",
     description="A distributed, sharded, in-memory key-value store with WAL support",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan
 )
 
-# Simple in-memory store (will be moved to a separate module later)
-store: dict[str, str] = {}
+# Simple in-memory store has been replaced by StorageEngine with WAL
 
 
 class KeyValue(BaseModel):
@@ -46,7 +75,7 @@ async def health_check():
     return {
         "status": "healthy",
         "node_id": node_id,
-        "keys_stored": len(store)
+        "keys_stored": await storage.size()
     }
 
 
@@ -64,14 +93,16 @@ async def get_value(key: str):
     Raises:
         404: If key doesn't exist
     """
-    if key not in store:
+    value = await storage.get(key)
+    
+    if value is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Key '{key}' not found"
         )
     
     logger.info(f"GET key='{key}'")
-    return ValueResponse(value=store[key])
+    return ValueResponse(value=value)
 
 
 @app.put("/kv/{key}")
@@ -88,7 +119,7 @@ async def put_value(key: str, request: KeyValue):
     """
     # Note: We use key from URL path, not from request body
     # This is intentional for RESTful design
-    store[key] = request.value
+    await storage.put(key, request.value)
     logger.info(f"PUT key='{key}', value_length={len(request.value)}")
     
     return {
@@ -111,13 +142,14 @@ async def delete_value(key: str):
     Raises:
         404: If key doesn't exist
     """
-    if key not in store:
+    deleted = await storage.delete(key)
+    
+    if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Key '{key}' not found"
         )
     
-    del store[key]
     logger.info(f"DELETE key='{key}'")
     
     return {
