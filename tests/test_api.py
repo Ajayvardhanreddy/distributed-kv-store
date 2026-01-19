@@ -4,8 +4,30 @@ Basic integration tests for the KV store API.
 These tests verify the core CRUD operations work correctly.
 """
 import pytest
+import tempfile
+import os
 from fastapi.testclient import TestClient
 from app.main import app
+import app.main as main_module
+from app.storage.engine import StorageEngine
+
+
+@pytest.fixture(autouse=True)
+async def setup_storage():
+    """Initialize storage for each test"""
+    # Create temp directory for test WAL
+    tmpdir = tempfile.mkdtemp()
+    wal_path = os.path.join(tmpdir, "test.wal")
+    
+    # Initialize storage
+    main_module.storage = StorageEngine(wal_path)
+    await main_module.storage.initialize()
+    
+    yield
+    
+    # Cleanup
+    await main_module.storage.close()
+
 
 client = TestClient(app)
 
