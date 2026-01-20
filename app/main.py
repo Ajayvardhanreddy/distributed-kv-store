@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import logging
 import os
 
-from app.storage.engine import StorageEngine
+from app.cluster.shard_manager import ShardManager
 
 # Configure logging
 logging.basicConfig(
@@ -18,8 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global storage engine instance
-storage: StorageEngine = None
+# Global storage instance (now manages multiple shards)
+storage: ShardManager = None
 
 
 @asynccontextmanager
@@ -27,21 +27,26 @@ async def lifespan(app: FastAPI):
     """
     Lifecycle manager for FastAPI application.
     
-    Handles startup (WAL replay) and shutdown (graceful close) events.
+    Handles startup (initialize shards, WAL replay) and shutdown (graceful close).
     """
     global storage
     
-    # Startup: Initialize storage and replay WAL
-    wal_path = os.getenv("WAL_PATH", "data/node.wal")
-    storage = StorageEngine(wal_path)
+    # Startup: Initialize shard manager
+    num_shards = int(os.getenv("NUM_SHARDS", "3"))
+    data_dir = os.getenv("DATA_DIR", "data")
+    
+    shard_ids = [f"shard-{i}" for i in range(num_shards)]
+    storage = ShardManager(shard_ids, data_dir)
     await storage.initialize()
-    logger.info(f"✅ Storage engine ready with {await storage.size()} keys")
+    
+    total_keys = await storage.size()
+    logger.info(f"✅ ShardManager ready with {num_shards} shards, {total_keys} total keys")
     
     yield
     
-    # Shutdown: Close storage gracefully
+    # Shutdown: Close all shards gracefully
     await storage.close()
-    logger.info("✅ Storage engine closed")
+    logger.info("✅ ShardManager closed")
 
 
 app = FastAPI(
@@ -158,14 +163,30 @@ async def delete_value(key: str):
     }
 
 
+@app.get("/stats")
+async def get_stats():
+    """
+    Get shard distribution statistics.
+    
+    Shows how keys are distributed across shards and virtual node counts.
+    """
+    return await storage.get_stats()
+
+
 @app.get("/")
 async def root():
     """Root endpoint with basic info"""
+    num_shards = len(storage.shards) if storage else 0
     return {
         "service": "Distributed KV Store",
-        "version": "0.1.0",
+        "version": "0.2.0",
+        "sharding": {
+            "enabled": True,
+            "num_shards": num_shards
+        },
         "endpoints": {
             "health": "/health",
+            "stats": "/stats",
             "get": "GET /kv/{key}",
             "put": "PUT /kv/{key}",
             "delete": "DELETE /kv/{key}"

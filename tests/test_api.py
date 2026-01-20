@@ -1,7 +1,7 @@
 """
 Basic integration tests for the KV store API.
 
-These tests verify the core CRUD operations work correctly.
+These tests verify the core CRUD operations work correctly with sharding.
 """
 import pytest
 import tempfile
@@ -9,18 +9,18 @@ import os
 from fastapi.testclient import TestClient
 from app.main import app
 import app.main as main_module
-from app.storage.engine import StorageEngine
+from app.cluster.shard_manager import ShardManager
 
 
 @pytest.fixture(autouse=True)
 async def setup_storage():
-    """Initialize storage for each test"""
-    # Create temp directory for test WAL
+    """Initialize sharded storage for each test"""
+    # Create temp directory for test WALs
     tmpdir = tempfile.mkdtemp()
-    wal_path = os.path.join(tmpdir, "test.wal")
     
-    # Initialize storage
-    main_module.storage = StorageEngine(wal_path)
+    # Initialize shard manager with 3 shards
+    shard_ids = ["test-shard-0", "test-shard-1", "test-shard-2"]
+    main_module.storage = ShardManager(shard_ids, tmpdir)
     await main_module.storage.initialize()
     
     yield
