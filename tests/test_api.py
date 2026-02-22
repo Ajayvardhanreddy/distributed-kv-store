@@ -1,32 +1,50 @@
 """
-Basic integration tests for the KV store API.
+API integration tests for the KV store.
 
-These tests verify the core CRUD operations work correctly with sharding.
+Tests run against a single-node ClusterRouter (no peers), so all
+operations are local — no HTTP forwarding takes place.
 """
-import pytest
-import tempfile
 import os
+import tempfile
+import pytest
 from fastapi.testclient import TestClient
-from app.main import app
+
 import app.main as main_module
-from app.cluster.shard_manager import ShardManager
+from app.cluster.consistent_hash import ConsistentHashRing
+from app.cluster.node_config import NodeConfig
+from app.cluster.router import ClusterRouter
+from app.main import app
+from app.storage.engine import StorageEngine
 
 
 @pytest.fixture(autouse=True)
-async def setup_storage():
-    """Initialize sharded storage for each test"""
-    # Create temp directory for test WALs
-    tmpdir = tempfile.mkdtemp()
-    
-    # Initialize shard manager with 3 shards
-    shard_ids = ["test-shard-0", "test-shard-1", "test-shard-2"]
-    main_module.storage = ShardManager(shard_ids, tmpdir)
-    await main_module.storage.initialize()
-    
-    yield
-    
-    # Cleanup
-    await main_module.storage.close()
+async def setup_cluster(monkeypatch):
+    """
+    Wire up a single-node ClusterRouter before every test.
+    Sets NODE_ID=node-0, PEERS=http://localhost:8000 so the router
+    treats every key as local (no HTTP calls needed).
+    """
+    monkeypatch.setenv("NODE_ID", "node-0")
+    monkeypatch.setenv("PEERS", "http://localhost:8000")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg = NodeConfig()
+        ring = ConsistentHashRing(num_vnodes=10)
+        ring.add_node("node-0")
+
+        storage = StorageEngine(os.path.join(tmpdir, "node-0.wal"))
+        await storage.initialize()
+
+        r = ClusterRouter(cfg, storage, ring)
+        await r.initialize()
+
+        main_module.config = cfg
+        main_module.router = r
+
+        yield
+
+        await r.close()
+        await storage.close()
 
 
 client = TestClient(app)
@@ -35,11 +53,12 @@ client = TestClient(app)
 def test_health_check():
     """Test that health check endpoint returns expected data"""
     response = client.get("/health")
-    
+
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "healthy"
-    assert "keys_stored" in data
+    assert "local_keys" in data
+    assert "node_id" in data
 
 
 def test_put_and_get():
