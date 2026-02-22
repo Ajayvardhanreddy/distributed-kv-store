@@ -1,20 +1,77 @@
-version: '3.8'
+version: "3.9"
+
+# Three independent KV store nodes, each owning one shard.
+# Every node can serve any key — if it doesn't own the key it
+# forwards the request to the correct peer automatically.
+#
+# Usage:
+#   docker-compose up --build       # start all 3 nodes
+#   docker-compose up node-0        # start only node-0
+#   docker-compose logs -f          # tail all logs
 
 services:
-  kv-node:
+
+  node-0:
     build: .
     ports:
       - "8000:8000"
-    volumes:
-      # Mount for live code reload during development
-      - ./app:/app/app
-      # Mount for persistent WAL storage
-      - ./data:/app/data
     environment:
-      - NODE_ID=node-1
-      - LOG_LEVEL=info
+      NODE_ID: node-0
+      NODE_PORT: 8000
+      # All 3 peers (including self). node-X name resolves inside Docker network.
+      PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
+      DATA_DIR: /app/data
+    volumes:
+      - ./data/node-0:/app/data
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
       retries: 3
+    networks:
+      - kv-net
+
+  node-1:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      NODE_ID: node-1
+      NODE_PORT: 8001
+      PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
+      DATA_DIR: /app/data
+    volumes:
+      - ./data/node-1:/app/data
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - kv-net
+
+  node-2:
+    build: .
+    ports:
+      - "8002:8002"
+    environment:
+      NODE_ID: node-2
+      NODE_PORT: 8002
+      PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
+      DATA_DIR: /app/data
+    volumes:
+      - ./data/node-2:/app/data
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8002/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - kv-net
+
+networks:
+  kv-net:
+    driver: bridge
