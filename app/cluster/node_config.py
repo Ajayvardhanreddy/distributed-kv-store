@@ -5,10 +5,12 @@ Each node reads its identity and peer list from environment variables.
 This allows the same Docker image to run as any node in the cluster.
 
 Environment variables:
-    NODE_ID   - Unique identifier for this node (e.g. "node-0")
-    NODE_PORT - Port this node listens on (default 8000)
-    PEERS     - Comma-separated HTTP URLs of ALL nodes including self
-                e.g. "http://node-0:8000,http://node-1:8001,http://node-2:8002"
+    NODE_ID            - Unique identifier for this node (e.g. "node-0")
+    NODE_PORT          - Port this node listens on (default 8000)
+    PEERS              - Comma-separated HTTP URLs of ALL nodes including self
+                         e.g. "http://node-0:8000,http://node-1:8001"
+    REPLICATION_FACTOR - How many nodes each key is written to (default 2)
+    DATA_DIR           - Directory for WAL files (default "data")
 """
 import os
 import logging
@@ -48,9 +50,14 @@ class NodeConfig:
         # WAL is stored per-node so each container has isolated storage
         self.data_dir: str = os.getenv("DATA_DIR", "data")
 
+        # How many physical nodes store each key.
+        # N=1 → no replication (Phase 3 behaviour)
+        # N=2 → 1 primary + 1 replica (default)
+        self.replication_factor: int = int(os.getenv("REPLICATION_FACTOR", "2"))
+
         logger.info(
             f"NodeConfig: id={self.node_id} port={self.port} "
-            f"peers={list(self.peers.keys())}"
+            f"peers={list(self.peers.keys())} rf={self.replication_factor}"
         )
 
     def peer_url(self, node_id: str) -> str:
