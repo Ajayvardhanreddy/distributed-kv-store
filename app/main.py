@@ -1,20 +1,22 @@
 """
-Distributed Key-Value Store - Main FastAPI Application  (Phase 3)
+Distributed Key-Value Store - Main FastAPI Application  (Phase 5)
 
 Each instance is one node in an N-node cluster.  Every node:
   • Owns one local shard (1 StorageEngine, 1 WAL file)
   • Knows all peer nodes via the PEERS env var
-  • Routes every public request to the correct owner via ClusterRouter
-  • Exposes /internal/kv/* for peer-to-peer forwarding (no re-forwarding)
+  • Routes every public request via ClusterRouter (may forward to peer)
+  • Exposes /internal/kv/* for peer-to-peer writes (no re-forwarding)
+  • Runs a background HealthChecker that pings peers every 5 s
+  • Falls back to replicas when the primary is down (Phase 5)
 """
 from contextlib import asynccontextmanager
 import logging
 
-import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 
 from app.cluster.consistent_hash import ConsistentHashRing
+from app.cluster.health_checker import HealthChecker
 from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
@@ -33,6 +35,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 config: NodeConfig = None
 router: ClusterRouter = None
+health: HealthChecker = None
 
 
 # ---------------------------------------------------------------------------
@@ -40,17 +43,17 @@ router: ClusterRouter = None
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, router
+    global config, router, health
 
-    # 1. Load node config from environment
+    # 1. Load node identity and peer list from environment
     config = NodeConfig()
 
-    # 2. Build consistent hash ring with one entry per node
+    # 2. Build consistent hash ring (same on every node — deterministic)
     ring = ConsistentHashRing(num_vnodes=150)
     for node_id in config.node_ids:
         ring.add_node(node_id)
 
-    # 3. Create local storage (this node only owns its own shard)
+    # 3. Local storage: one WAL file per node
     import os
     wal_path = os.path.join(config.data_dir, f"{config.node_id}.wal")
     storage = StorageEngine(wal_path)
@@ -59,16 +62,22 @@ async def lifespan(app: FastAPI):
     local_keys = await storage.size()
     logger.info(
         f"✅ Node '{config.node_id}' started | "
-        f"peers={config.node_ids} | local_keys={local_keys}"
+        f"peers={config.node_ids} | rf={config.replication_factor} | "
+        f"local_keys={local_keys}"
     )
 
-    # 4. Wire up the cluster router
-    router = ClusterRouter(config, storage, ring)
+    # 4. Start health checker (background ping loop)
+    health = HealthChecker(config)
+    await health.start()
+
+    # 5. Wire up the cluster router, injecting the health checker
+    router = ClusterRouter(config, storage, ring, health=health)
     await router.initialize()
 
     yield
 
-    # Shutdown
+    # Shutdown — stop background tasks before closing storage
+    await health.stop()
     await router.close()
     await storage.close()
     logger.info(f"✅ Node '{config.node_id}' shut down")
@@ -79,8 +88,8 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Distributed Key-Value Store",
-    description="Multi-node distributed KV store with consistent hashing",
-    version="0.3.0",
+    description="Multi-node distributed KV store with consistent hashing and replication",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -195,34 +204,44 @@ async def internal_delete(key: str):
 @app.get("/cluster/health")
 async def cluster_health():
     """
-    Ping every peer and report their health.
-    This node's entry is filled locally; peers are called via HTTP.
+    Aggregated cluster health view.
+
+    Uses the local HealthChecker's cached state (no live HTTP calls
+    on this endpoint) so it responds instantly even when peers are down.
+    Each peer's entry also shows their own view via /health when available.
     """
-    results = {}
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for node_id, base_url in config.peers.items():
-            if config.is_local(node_id):
-                results[node_id] = {
-                    "status": "healthy",
-                    "local_keys": await router.local_size(),
-                }
-            else:
-                try:
-                    resp = await client.get(f"{base_url}/health")
-                    results[node_id] = resp.json()
-                except httpx.RequestError:
-                    results[node_id] = {"status": "unreachable"}
-    return {"cluster": results}
+    health_map = health.get_status()   # dict[node_id, bool]
+
+    results: dict = {}
+    for node_id, is_up in health_map.items():
+        if config.is_local(node_id):
+            results[node_id] = {
+                "status": "healthy",
+                "node_id": node_id,
+                "local_keys": await router.local_size(),
+                "replication_factor": config.replication_factor,
+            }
+        else:
+            results[node_id] = {
+                "status": "healthy" if is_up else "unreachable",
+            }
+
+    return {
+        "cluster": results,
+        "replication_factor": config.replication_factor,
+    }
 
 
 @app.get("/stats")
 async def get_stats():
-    """Local shard stats for this node."""
+    """Local node stats plus cluster health snapshot."""
     return {
         "node_id": config.node_id,
+        "version": "0.5.0",
         "local_keys": await router.local_size(),
-        "owner_node": config.node_id,
+        "replication_factor": config.replication_factor,
         "peers": config.node_ids,
+        "peer_health": health.get_status(),
     }
 
 
@@ -231,7 +250,7 @@ async def root():
     """Root — service info."""
     return {
         "service": "Distributed KV Store",
-        "version": "0.3.0",
+        "version": "0.5.0",
         "node_id": config.node_id if config else "unknown",
         "endpoints": {
             "health": "/health",

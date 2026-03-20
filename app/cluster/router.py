@@ -1,25 +1,23 @@
 """
-Cluster-aware request router — Phase 4: Replication
+Cluster-aware request router — Phase 5: Replica Read Fallback
 
-Every write (PUT / DELETE) is replicated synchronously to all N nodes
-before the client gets a response.  Replication set for a key:
-
-  [primary, replica-1, ..., replica-(N-1)]
-  = first N distinct nodes walking clockwise on the hash ring
-
-Read strategy : primary only (replica fallback is Phase 5).
-Write strategy: fan-out to ALL nodes in parallel via asyncio.gather.
-  If any replica is unreachable → RuntimeError → HTTP 503.
+Write path (Phase 4): fan-out PUT/DELETE to ALL N nodes in parallel.
+Read path  (Phase 5): try nodes in replication-set order, skipping any
+  the HealthChecker has marked down.  Falls back to replicas when the
+  primary is unavailable — AP trade-off from the CAP theorem.
 """
 import asyncio
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
 from app.cluster.consistent_hash import ConsistentHashRing
 from app.cluster.node_config import NodeConfig
 from app.storage.engine import StorageEngine
+
+if TYPE_CHECKING:
+    from app.cluster.health_checker import HealthChecker
 
 logger = logging.getLogger(__name__)
 
@@ -42,19 +40,22 @@ class ClusterRouter:
         config: NodeConfig,
         storage: StorageEngine,
         ring: ConsistentHashRing,
+        health: Optional["HealthChecker"] = None,
     ):
         self.config = config
         self.storage = storage
         self.ring = ring
         self.replication_factor: int = config.replication_factor
-        # Shared async HTTP client; created in initialize(), closed in close()
+        # HealthChecker: injected at startup (None → treat all nodes healthy)
+        self.health = health
         self._client: Optional[httpx.AsyncClient] = None
 
     async def initialize(self) -> None:
         """Open the shared HTTP client."""
         self._client = httpx.AsyncClient(timeout=FORWARD_TIMEOUT)
         logger.info(
-            f"ClusterRouter ready (replication_factor={self.replication_factor})"
+            f"ClusterRouter ready (rf={self.replication_factor}, "
+            f"health_checker={'on' if self.health else 'off'})"
         )
 
     async def close(self) -> None:
@@ -68,11 +69,33 @@ class ClusterRouter:
     # ------------------------------------------------------------------
 
     async def get(self, key: str) -> Optional[str]:
-        """Read from the PRIMARY node only."""
-        primary = self.ring.get_node(key)
-        if self.config.is_local(primary):
-            return await self.storage.get(key)
-        return await self._forward_get(primary, key)
+        """
+        Read with replica fallback.
+
+        Tries each node in the replication set in order (primary first).
+        Skips nodes the HealthChecker has already marked down.
+        On a network error, marks the node down immediately and tries the next.
+        Raises RuntimeError only if every replica in the set is exhausted.
+        """
+        candidates = self.ring.get_nodes(key, n=self.replication_factor)
+
+        for node_id in candidates:
+            # Skip nodes we already know are down
+            if self.health and not self.health.is_healthy(node_id):
+                logger.debug(f"GET '{key}': skipping {node_id} (marked down)")
+                continue
+
+            try:
+                if self.config.is_local(node_id):
+                    return await self.storage.get(key)
+                return await self._forward_get(node_id, key)
+            except RuntimeError:
+                # Network failure — mark down immediately, try next replica
+                if self.health:
+                    self.health.mark_down(node_id)
+                logger.warning(f"GET '{key}': {node_id} failed, trying next replica")
+
+        raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
 
     async def put(self, key: str, value: str) -> None:
         """

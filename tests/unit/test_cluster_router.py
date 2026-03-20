@@ -27,11 +27,15 @@ def make_ring(node_ids: list[str], num_vnodes: int = 10) -> ConsistentHashRing:
     return ring
 
 
-async def make_router(tmpdir: str, node_id: str, peers: list[str], monkeypatch) -> ClusterRouter:
+async def make_router(
+    tmpdir: str, node_id: str, peers: list[str], monkeypatch,
+    replication_factor: int = 1,
+) -> ClusterRouter:
     """Build a ClusterRouter with node_id as the local node."""
     peer_str = ",".join(peers)
     monkeypatch.setenv("NODE_ID", node_id)
     monkeypatch.setenv("PEERS", peer_str)
+    monkeypatch.setenv("REPLICATION_FACTOR", str(replication_factor))
 
     cfg = NodeConfig()
     ring = make_ring(cfg.node_ids)
@@ -183,12 +187,19 @@ async def test_forward_put_called_for_remote_key(monkeypatch):
 @pytest.mark.asyncio
 async def test_unreachable_peer_raises_runtime_error(monkeypatch):
     """
-    When the HTTP forward call fails (peer down), ClusterRouter must
-    raise RuntimeError so main.py can convert it to HTTP 503.
+    When the HTTP forward call fails (peer down) and there is NO local
+    replica to fall back to, ClusterRouter must raise RuntimeError so
+    main.py can convert it to HTTP 503.
+
+    rf=1 means the replication set is exactly [primary], so when that
+    forward fails there is nothing else to try.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         peers = ["http://localhost:8000", "http://localhost:8001"]
-        router, storage = await make_router(tmpdir, "node-0", peers, monkeypatch)
+        # rf=1: no replica fallback, the remote primary is the only candidate
+        router, storage = await make_router(
+            tmpdir, "node-0", peers, monkeypatch, replication_factor=1
+        )
 
         remote_key = None
         for i in range(500):
@@ -199,7 +210,6 @@ async def test_unreachable_peer_raises_runtime_error(monkeypatch):
 
         assert remote_key is not None
 
-        import httpx
         router._forward_get = AsyncMock(
             side_effect=RuntimeError("Peer node-1 unreachable")
         )
