@@ -1,5 +1,5 @@
 """
-Distributed Key-Value Store - Main FastAPI Application  (Phase 5)
+Distributed Key-Value Store - Main FastAPI Application  (Phase 7)
 
 Each instance is one node in an N-node cluster.  Every node:
   • Owns one local shard (1 StorageEngine, 1 WAL file)
@@ -146,9 +146,22 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
 app = FastAPI(
     title="Distributed Key-Value Store",
     description="Multi-node distributed KV store with consistent hashing and replication",
-    version="0.5.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics  (auto-instruments all endpoints → /metrics)
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator(
+        should_group_status_codes=False,
+        excluded_handlers=["/metrics"],
+    ).instrument(app).expose(app, include_in_schema=False)
+    logger.info("Prometheus metrics enabled at /metrics")
+except ImportError:
+    logger.warning("prometheus-fastapi-instrumentator not installed — /metrics disabled")
 
 
 # ---------------------------------------------------------------------------
