@@ -130,12 +130,23 @@ class StorageEngine:
     async def size(self) -> int:
         """
         Get the number of keys stored.
-        
+
         Returns:
             Number of keys in the store
         """
         async with self.lock:
             return len(self.store)
+
+    async def snapshot(self) -> dict[str, str]:
+        """
+        Return a safe copy of all key-value pairs in local storage.
+
+        Used by the /internal/sync endpoint so a rejoining node can
+        pull current state from a live peer without holding the lock
+        for long (we copy then release).
+        """
+        async with self.lock:
+            return dict(self.store)
     
     async def close(self) -> None:
         """

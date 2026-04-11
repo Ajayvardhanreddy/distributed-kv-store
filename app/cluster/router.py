@@ -1,10 +1,16 @@
 """
-Cluster-aware request router — Phase 5: Replica Read Fallback
+Cluster-aware request router — Phase 6: Leader Promotion
 
-Write path (Phase 4): fan-out PUT/DELETE to ALL N nodes in parallel.
-Read path  (Phase 5): try nodes in replication-set order, skipping any
-  the HealthChecker has marked down.  Falls back to replicas when the
-  primary is unavailable — AP trade-off from the CAP theorem.
+Read  path (Phase 5): try replication set in order, skip down nodes.
+Write path (Phase 6): route to the first HEALTHY node in the replication
+  set — the "write-leader".  If the ring's original primary is down, the
+  first live replica is automatically promoted as the new write target.
+
+This gives automatic leader failover without Raft.  The trade-off:
+  Two nodes may briefly disagree on leader identity if their HealthChecker
+  views diverge — a split-brain window of at most one check-interval (~5 s).
+  Raft would close this window but adds significant complexity.  We document
+  this as an explicit AP choice (see README).
 """
 import asyncio
 import logging
@@ -99,35 +105,55 @@ class ClusterRouter:
 
     async def put(self, key: str, value: str) -> None:
         """
-        Write to ALL nodes in the replication set in parallel.
+        Write to the current write-leader + all other healthy replicas.
 
-        Uses asyncio.gather so every HTTP call fires concurrently.
-        All must succeed; any failure raises RuntimeError → HTTP 503.
+        The write-leader = first healthy node in the replication set.
+        If the ring's original primary is down, the first live replica
+        is automatically promoted — no manual intervention needed.
+
+        Fan-out to ALL healthy nodes concurrently so every live replica
+        gets the write.  Nodes that are down at write time will catch up
+        via the sync-on-rejoin anti-entropy on their next startup.
         """
         owners = self.ring.get_nodes(key, n=self.replication_factor)
-        logger.info(f"PUT '{key}' replication_set={owners}")
-        await self._write_all(owners, key, value, op="put")
+        leader = self._write_leader(owners)
+        if leader is None:
+            raise RuntimeError(f"No healthy node available for key '{key}'")
+
+        # Fan-out to ALL healthy replicas (skip known-down nodes)
+        healthy_owners = [
+            n for n in owners
+            if self.health is None or self.health.is_healthy(n)
+        ]
+        logger.info(f"PUT '{key}' leader={leader} healthy_replicas={healthy_owners}")
+        await self._write_all(healthy_owners, key, value, op="put")
 
     async def delete(self, key: str) -> bool:
         """
-        Delete from ALL nodes in the replication set.
+        Delete from all healthy nodes in the replication set.
 
-        Returns True if the key existed on the primary.
+        Existence is checked on the write-leader (not necessarily the
+        original ring primary).  Returns True only if the key existed.
         """
         owners = self.ring.get_nodes(key, n=self.replication_factor)
-        primary = owners[0]
+        leader = self._write_leader(owners)
+        if leader is None:
+            raise RuntimeError(f"No healthy node available for key '{key}'")
 
-        # Check existence on primary before fanning out
-        if self.config.is_local(primary):
+        # Check existence on the current write-leader
+        if self.config.is_local(leader):
             if not await self.storage.exists(key):
                 return False
         else:
-            primary_val = await self._forward_get(primary, key)
-            if primary_val is None:
+            if await self._forward_get(leader, key) is None:
                 return False
 
-        logger.info(f"DELETE '{key}' replication_set={owners}")
-        await self._write_all(owners, key, value=None, op="delete")
+        healthy_owners = [
+            n for n in owners
+            if self.health is None or self.health.is_healthy(n)
+        ]
+        logger.info(f"DELETE '{key}' leader={leader} healthy_replicas={healthy_owners}")
+        await self._write_all(healthy_owners, key, value=None, op="delete")
         return True
 
     async def exists(self, key: str) -> bool:
@@ -139,12 +165,33 @@ class ClusterRouter:
         return await self.storage.size()
 
     def owner_of(self, key: str) -> str:
-        """Primary node for a key."""
+        """Ring-assigned primary for a key (may be down; use write_leader_of() for routing)."""
         return self.ring.get_node(key)
+
+    def write_leader_of(self, key: str) -> Optional[str]:
+        """Current write-leader for a key — first healthy node in replication set."""
+        return self._write_leader(self.ring.get_nodes(key, n=self.replication_factor))
 
     def replicas_of(self, key: str) -> list[str]:
         """Full replication set [primary, replica-1, ...] for a key."""
         return self.ring.get_nodes(key, n=self.replication_factor)
+
+    # ------------------------------------------------------------------
+    # Leader selection
+    # ------------------------------------------------------------------
+
+    def _write_leader(self, ordered_nodes: list[str]) -> Optional[str]:
+        """
+        Return the first healthy node from an ordered candidate list.
+
+        This is the write-leader: the node that will coordinate the write.
+        If HealthChecker is not configured, the first node always wins
+        (original Phase 3/4 behaviour, all nodes assumed healthy).
+        """
+        for node_id in ordered_nodes:
+            if self.health is None or self.health.is_healthy(node_id):
+                return node_id
+        return None   # all candidates are down
 
     # ------------------------------------------------------------------
     # Fan-out helper
