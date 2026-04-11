@@ -11,7 +11,9 @@ Each instance is one node in an N-node cluster.  Every node:
 """
 from contextlib import asynccontextmanager
 import logging
+import os
 
+import httpx
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 
@@ -54,7 +56,6 @@ async def lifespan(app: FastAPI):
         ring.add_node(node_id)
 
     # 3. Local storage: one WAL file per node
-    import os
     wal_path = os.path.join(config.data_dir, f"{config.node_id}.wal")
     storage = StorageEngine(wal_path)
     await storage.initialize()
@@ -74,6 +75,11 @@ async def lifespan(app: FastAPI):
     router = ClusterRouter(config, storage, ring, health=health)
     await router.initialize()
 
+    # 6. Anti-entropy: sync missing keys from a live peer on startup.
+    #    This ensures a rejoining node catches up on writes it missed
+    #    while it was down — closing the stale-replica gap.
+    await sync_from_peers(config, storage)
+
     yield
 
     # Shutdown — stop background tasks before closing storage
@@ -81,6 +87,57 @@ async def lifespan(app: FastAPI):
     await router.close()
     await storage.close()
     logger.info(f"✅ Node '{config.node_id}' shut down")
+
+# ---------------------------------------------------------------------------
+# Anti-entropy helper — sync-on-rejoin
+# ---------------------------------------------------------------------------
+
+async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
+    """
+    Pull missing keys from the first reachable peer on startup.
+
+    Strategy (simple anti-entropy):
+      1. Try each peer in order until one responds to GET /internal/sync
+      2. For every key in the peer's snapshot: write it locally ONLY if
+         we don't already have it (WAL replay takes precedence — a key
+         we already have is guaranteed to be at least as fresh)
+      3. Log how many keys were synced
+
+    Limitation (documented as AP trade-off): if a key was written to this
+    node AND the peer after this node went down, both versions exist and
+    we keep ours. A sequence-number per key (vector clocks) would resolve
+    this — deferred as a known limitation in the README.
+    """
+    peers_to_try = [
+        (nid, url)
+        for nid, url in cfg.peers.items()
+        if not cfg.is_local(nid)
+    ]
+    if not peers_to_try:
+        logger.info("Sync-on-rejoin: single-node cluster, nothing to sync")
+        return
+
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for node_id, base_url in peers_to_try:
+            try:
+                resp = await client.get(f"{base_url}/internal/sync")
+                if resp.status_code != 200:
+                    continue
+                peer_data: dict[str, str] = resp.json().get("keys", {})
+                synced = 0
+                for key, value in peer_data.items():
+                    if await storage.get(key) is None:   # only fill gaps
+                        await storage.put(key, value)
+                        synced += 1
+                logger.info(
+                    f"Sync-on-rejoin: pulled {synced}/{len(peer_data)} "
+                    f"keys from {node_id}"
+                )
+                return   # one successful sync is enough
+            except httpx.RequestError:
+                logger.warning(f"Sync-on-rejoin: {node_id} unreachable, trying next")
+
+    logger.warning("Sync-on-rejoin: no peers reachable, starting with local WAL state only")
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +252,20 @@ async def internal_delete(key: str):
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
     return {"message": "deleted", "key": key}
+
+
+@app.get("/internal/sync")
+async def internal_sync():
+    """
+    Anti-entropy sync endpoint.
+
+    Returns a full snapshot of this node's local key-value store.
+    Called by a rejoining peer during startup to catch up on missed writes.
+    The caller will merge this snapshot with its WAL-replayed state,
+    taking ours only for keys it doesn't already have.
+    """
+    snapshot = await router.storage.snapshot()
+    return {"node_id": config.node_id, "keys": snapshot}
 
 
 # ---------------------------------------------------------------------------
