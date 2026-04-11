@@ -5,9 +5,13 @@ version: "3.9"
 # forwards the request to the correct peer automatically.
 #
 # Usage:
-#   docker-compose up --build       # start all 3 nodes
+#   docker-compose up --build       # start all 3 nodes + monitoring
 #   docker-compose up node-0        # start only node-0
 #   docker-compose logs -f          # tail all logs
+#
+# Monitoring:
+#   Prometheus:  http://localhost:9090
+#   Grafana:     http://localhost:3000  (admin/admin)
 
 services:
 
@@ -72,6 +76,37 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+    networks:
+      - kv-net
+
+  # -----------------------------------------------------------------------
+  # Observability stack
+  # -----------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1d"
+    networks:
+      - kv-net
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
     networks:
       - kv-net
 

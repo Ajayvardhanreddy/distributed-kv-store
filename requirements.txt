@@ -13,3 +13,9 @@ httpx>=0.24.0
 
 # Docker health checks / utilities
 psutil>=5.9.0
+
+# Observability
+prometheus-fastapi-instrumentator>=6.0.0
+
+# Benchmarks (optional — not required for running the app)
+matplotlib>=3.8.0
