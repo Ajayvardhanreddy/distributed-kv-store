@@ -6,6 +6,12 @@ while ensuring durability through the Write-Ahead Log.
 
 All mutations are logged before being applied to memory, ensuring
 crash recovery is possible by replaying the WAL.
+
+Each key carries a monotonic version counter that increments on every
+write.  This allows:
+  - Conflict detection during split-brain (compare versions)
+  - Staleness detection on reads (client can see the version)
+  - Smarter sync-on-rejoin (accept higher-version only)
 """
 from typing import Optional
 import asyncio
@@ -17,149 +23,125 @@ logger = logging.getLogger(__name__)
 
 class StorageEngine:
     """
-    Thread-safe in-memory key-value storage with WAL-backed durability.
-    
+    Thread-safe in-memory key-value storage with WAL-backed durability
+    and per-key monotonic versioning.
+
+    Version semantics:
+        - New key → version 1
+        - Each subsequent put → version + 1
+        - Delete removes the key and its version
+        - put_versioned() accepts an explicit version (used by replica fan-out)
+
     Usage:
         engine = StorageEngine("data/node.wal")
-        await engine.put("key", "value")
-        value = await engine.get("key")
-        await engine.delete("key")
-        await engine.close()
-    
-    All operations are async and thread-safe through asyncio.Lock.
-    State is recovered from WAL automatically on initialization.
+        await engine.initialize()
+        await engine.put("key", "value")       # version = 1
+        val, ver = await engine.get("key")     # ("value", 1)
+        await engine.put("key", "value2")      # version = 2
     """
-    
-    def __init__(self, wal_path: str):
-        """
-        Initialize storage engine with WAL at specified path.
-        
-        Args:
-            wal_path: Path to WAL file (e.g., "data/node.wal")
-            
-        The WAL is replayed synchronously during initialization to
-        restore previous state before accepting new operations.
-        """
-        self.wal = WriteAheadLog(wal_path)
+
+    def __init__(self, wal_path: str, durability: str = "strict"):
+        self.wal = WriteAheadLog(wal_path, durability=durability)
         self.lock = asyncio.Lock()
-        self.store: dict[str, str] = {}
+        # Internal store: key → {"value": str, "version": int}
+        self.store: dict[str, dict] = {}
         self._closed = False
-        
         logger.info(f"Initializing storage engine with WAL: {wal_path}")
-    
+
     async def initialize(self) -> None:
         """
-        Replay WAL to restore state.
-        
-        This should be called once after construction, typically in
-        FastAPI's startup event.
+        Replay WAL to restore state (including versions).
         """
         logger.info("Replaying WAL to restore state...")
         self.store = await self.wal.replay()
         logger.info(f"Storage engine initialized with {len(self.store)} keys")
-    
-    async def get(self, key: str) -> Optional[str]:
+
+    async def get(self, key: str) -> tuple[Optional[str], int]:
         """
-        Retrieve value for a key.
-        
-        Args:
-            key: The key to look up
-            
+        Retrieve value and version for a key.
+
         Returns:
-            The value if key exists, None otherwise
+            (value, version) if key exists, (None, 0) otherwise
         """
         async with self.lock:
-            return self.store.get(key)
-    
-    async def put(self, key: str, value: str) -> None:
+            entry = self.store.get(key)
+            if entry is None:
+                return None, 0
+            return entry["value"], entry["version"]
+
+    async def put(self, key: str, value: str) -> int:
         """
-        Store a key-value pair.
-        
-        The operation is logged to WAL before updating memory,
-        ensuring durability even if the process crashes immediately after.
-        
-        Args:
-            key: The key to store
-            value: The value to store
+        Store a key-value pair, auto-incrementing the version.
+
+        Returns:
+            The new version number
         """
         async with self.lock:
-            # Write to WAL first (durability)
-            await self.wal.append("PUT", key, value)
-            
-            # Then update in-memory store
-            self.store[key] = value
-            
-        logger.debug(f"PUT {key} (size: {len(value)} bytes)")
-    
+            # Increment version (or start at 1 for new keys)
+            current = self.store.get(key)
+            new_version = (current["version"] + 1) if current else 1
+
+            await self.wal.append("PUT", key, value, version=new_version)
+            self.store[key] = {"value": value, "version": new_version}
+
+        logger.debug(f"PUT {key} ver={new_version}")
+        return new_version
+
+    async def put_versioned(self, key: str, value: str, version: int) -> None:
+        """
+        Store a key-value pair with an explicit version.
+
+        Used by replica fan-out: the write-leader decides the version,
+        replicas accept it as-is.  Also used by sync-on-rejoin to
+        accept a peer's version if it is higher than ours.
+        """
+        async with self.lock:
+            await self.wal.append("PUT", key, value, version=version)
+            self.store[key] = {"value": value, "version": version}
+        logger.debug(f"PUT_VERSIONED {key} ver={version}")
+
     async def delete(self, key: str) -> bool:
         """
         Delete a key-value pair.
-        
-        Args:
-            key: The key to delete
-            
+
         Returns:
             True if key existed and was deleted, False otherwise
         """
         async with self.lock:
             if key not in self.store:
                 return False
-            
-            # Write to WAL first
-            await self.wal.append("DELETE", key)
-            
-            # Then delete from memory
+            await self.wal.append("DELETE", key, version=0)
             del self.store[key]
-            
+
         logger.debug(f"DELETE {key}")
         return True
-    
+
     async def exists(self, key: str) -> bool:
-        """
-        Check if a key exists.
-        
-        Args:
-            key: The key to check
-            
-        Returns:
-            True if key exists, False otherwise
-        """
         async with self.lock:
             return key in self.store
-    
-    async def size(self) -> int:
-        """
-        Get the number of keys stored.
 
-        Returns:
-            Number of keys in the store
-        """
+    async def size(self) -> int:
         async with self.lock:
             return len(self.store)
 
-    async def snapshot(self) -> dict[str, str]:
+    async def snapshot(self) -> dict[str, dict]:
         """
-        Return a safe copy of all key-value pairs in local storage.
+        Return a safe copy of all key-value pairs with versions.
 
-        Used by the /internal/sync endpoint so a rejoining node can
-        pull current state from a live peer without holding the lock
-        for long (we copy then release).
+        Used by /internal/sync so a rejoining node can pull current
+        state and compare versions.
+
+        Returns:
+            {key: {"value": str, "version": int}, ...}
         """
         async with self.lock:
-            return dict(self.store)
-    
+            return {k: dict(v) for k, v in self.store.items()}
+
     async def close(self) -> None:
-        """
-        Close the storage engine and WAL.
-        
-        Should be called during application shutdown to ensure
-        all data is flushed properly.
-        """
         if self._closed:
             return
-        
         async with self.lock:
             await self.wal.close()
             self._closed = True
-            
         logger.info("Storage engine closed")
+

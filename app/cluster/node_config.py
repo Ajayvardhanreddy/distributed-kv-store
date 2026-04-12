@@ -55,9 +55,13 @@ class NodeConfig:
         # N=2 → 1 primary + 1 replica (default)
         self.replication_factor: int = int(os.getenv("REPLICATION_FACTOR", "2"))
 
+        # WAL durability mode: "strict" (fsync per write) or "relaxed" (batched)
+        self.durability: str = os.getenv("DURABILITY", "strict")
+
         logger.info(
             f"NodeConfig: id={self.node_id} port={self.port} "
-            f"peers={list(self.peers.keys())} rf={self.replication_factor}"
+            f"peers={list(self.peers.keys())} rf={self.replication_factor} "
+            f"durability={self.durability}"
         )
 
     def peer_url(self, node_id: str) -> str:

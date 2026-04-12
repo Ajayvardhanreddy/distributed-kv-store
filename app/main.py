@@ -1,5 +1,5 @@
 """
-Distributed Key-Value Store - Main FastAPI Application  (Phase 7)
+Distributed Key-Value Store - Main FastAPI Application  (Phase 8)
 
 Each instance is one node in an N-node cluster.  Every node:
   • Owns one local shard (1 StorageEngine, 1 WAL file)
@@ -12,6 +12,7 @@ Each instance is one node in an N-node cluster.  Every node:
 from contextlib import asynccontextmanager
 import logging
 import os
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
@@ -57,8 +58,10 @@ async def lifespan(app: FastAPI):
 
     # 3. Local storage: one WAL file per node
     wal_path = os.path.join(config.data_dir, f"{config.node_id}.wal")
-    storage = StorageEngine(wal_path)
+    storage = StorageEngine(wal_path, durability=config.durability)
     await storage.initialize()
+    # Start background WAL flush loop (only active in relaxed mode)
+    await storage.wal.start_flush_loop()
 
     local_keys = await storage.size()
     logger.info(
@@ -94,19 +97,15 @@ async def lifespan(app: FastAPI):
 
 async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
     """
-    Pull missing keys from the first reachable peer on startup.
+    Pull missing or stale keys from the first reachable peer on startup.
 
-    Strategy (simple anti-entropy):
-      1. Try each peer in order until one responds to GET /internal/sync
-      2. For every key in the peer's snapshot: write it locally ONLY if
-         we don't already have it (WAL replay takes precedence — a key
-         we already have is guaranteed to be at least as fresh)
+    Strategy (version-aware anti-entropy):
+      1. Try each peer until one responds to GET /internal/sync
+      2. For every key in the peer's snapshot:
+         - If we don't have the key → accept it
+         - If we have it but peer has a higher version → accept theirs
+         - Otherwise → keep ours (our WAL-replayed state takes precedence)
       3. Log how many keys were synced
-
-    Limitation (documented as AP trade-off): if a key was written to this
-    node AND the peer after this node went down, both versions exist and
-    we keep ours. A sequence-number per key (vector clocks) would resolve
-    this — deferred as a known limitation in the README.
     """
     peers_to_try = [
         (nid, url)
@@ -123,11 +122,15 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
                 resp = await client.get(f"{base_url}/internal/sync")
                 if resp.status_code != 200:
                     continue
-                peer_data: dict[str, str] = resp.json().get("keys", {})
+                peer_data: dict = resp.json().get("keys", {})
                 synced = 0
-                for key, value in peer_data.items():
-                    if await storage.get(key) is None:   # only fill gaps
-                        await storage.put(key, value)
+                for key, entry in peer_data.items():
+                    peer_value = entry.get("value", entry) if isinstance(entry, dict) else entry
+                    peer_version = entry.get("version", 1) if isinstance(entry, dict) else 1
+
+                    local_value, local_version = await storage.get(key)
+                    if local_value is None or peer_version > local_version:
+                        await storage.put_versioned(key, peer_value, peer_version)
                         synced += 1
                 logger.info(
                     f"Sync-on-rejoin: pulled {synced}/{len(peer_data)} "
@@ -146,7 +149,7 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
 app = FastAPI(
     title="Distributed Key-Value Store",
     description="Multi-node distributed KV store with consistent hashing and replication",
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 
@@ -171,6 +174,7 @@ class KeyValue(BaseModel):
     """Request body for PUT operations."""
     key: str
     value: str
+    version: Optional[int] = None
 
 
 class ValueResponse(BaseModel):
@@ -192,11 +196,11 @@ async def health_check():
     }
 
 
-@app.get("/kv/{key}", response_model=ValueResponse)
+@app.get("/kv/{key}")
 async def get_value(key: str):
-    """Retrieve a value.  Forwards to the owning node if needed."""
+    """Retrieve a value with version.  Forwards to the owning node if needed."""
     try:
-        value = await router.get(key)
+        value, version = await router.get(key)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -205,20 +209,20 @@ async def get_value(key: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Key '{key}' not found",
         )
-    logger.info(f"GET '{key}' owner={router.owner_of(key)}")
-    return ValueResponse(value=value)
+    logger.info(f"GET '{key}' owner={router.owner_of(key)} ver={version}")
+    return {"value": value, "version": version}
 
 
 @app.put("/kv/{key}")
 async def put_value(key: str, request: KeyValue):
-    """Store a value.  Forwards to the owning node if needed."""
+    """Store a value.  Returns the new version number."""
     try:
-        await router.put(key, request.value)
+        version = await router.put(key, request.value)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    logger.info(f"PUT '{key}' owner={router.owner_of(key)}")
-    return {"message": "success", "key": key}
+    logger.info(f"PUT '{key}' owner={router.owner_of(key)} ver={version}")
+    return {"message": "success", "key": key, "version": version}
 
 
 @app.delete("/kv/{key}")
@@ -242,20 +246,30 @@ async def delete_value(key: str):
 # Internal endpoints  (peer-to-peer only — NO further forwarding)
 # ---------------------------------------------------------------------------
 
-@app.get("/internal/kv/{key}", response_model=ValueResponse)
+@app.get("/internal/kv/{key}")
 async def internal_get(key: str):
     """Internal GET — reads directly from local storage, no forwarding."""
-    value = await router.storage.get(key)
+    value, version = await router.storage.get(key)
     if value is None:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
-    return ValueResponse(value=value)
+    return {"value": value, "version": version}
 
 
 @app.put("/internal/kv/{key}")
 async def internal_put(key: str, request: KeyValue):
-    """Internal PUT — writes directly to local storage, no forwarding."""
-    await router.storage.put(key, request.value)
-    return {"message": "success", "key": key}
+    """
+    Internal PUT — writes directly to local storage, no forwarding.
+
+    If the request includes a 'version' field, we use put_versioned()
+    to accept the leader's version as-is (replica fan-out).
+    If no version, we auto-increment (leader path).
+    """
+    if hasattr(request, 'version') and request.version is not None:
+        await router.storage.put_versioned(key, request.value, request.version)
+        version = request.version
+    else:
+        version = await router.storage.put(key, request.value)
+    return {"message": "success", "key": key, "version": version}
 
 
 @app.delete("/internal/kv/{key}")

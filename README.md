@@ -1,6 +1,8 @@
 # Distributed Key-Value Store
 
-A fault-tolerant, distributed in-memory key-value store built from scratch in Python. Demonstrates core distributed systems concepts: consistent hashing, synchronous replication, automatic leader failover, write-ahead logging, and crash recovery — all without external dependencies like etcd or ZooKeeper.
+A fault-tolerant, distributed in-memory key-value store built from scratch in Python. Demonstrates core distributed systems concepts: consistent hashing, synchronous replication, automatic leader failover, write-ahead logging, per-key versioning, and crash recovery — all without external dependencies like etcd or ZooKeeper.
+
+> **[System Design Reference →](DESIGN.md)** — Sequence diagrams for every critical path
 
 ---
 
@@ -65,7 +67,10 @@ The write-leader for each key is the **first healthy node** in that key's replic
 Each node runs a `HealthChecker` background task that pings all peers every 5 seconds. The router also marks a node down immediately on any network error.
 
 ### Write-Ahead Log (WAL) Durability
-Every mutation is appended to a per-node WAL file before being applied to memory. On restart, the WAL is replayed to restore state.
+Every mutation is appended to a per-node WAL file before being applied to memory. On restart, the WAL is replayed to restore state. Supports `DURABILITY=strict` (sync every write) and `DURABILITY=relaxed` (batch every 100ms for ~5-10× throughput).
+
+### Per-Key Monotonic Versioning
+Every key carries a version counter (starts at 1, incremented on each PUT). Enables conflict detection during sync-on-rejoin — higher version always wins. Clients receive the version in every GET/PUT response.
 
 ### Sync-on-Rejoin (Anti-Entropy)
 When a node restarts after a crash it pulls missing keys from a live peer via `GET /internal/sync` before accepting traffic.
@@ -128,6 +133,7 @@ Each major design choice is documented with context, alternatives considered, an
 | [003](docs/decisions/003-why-not-raft.md) | Ring-based leader election, not Raft | AP trade-off: immediate failover vs ~5s split-brain window |
 | [004](docs/decisions/004-ap-over-cp.md) | AP over CP | Availability priority, like DynamoDB |
 | [005](docs/decisions/005-wal-before-memory.md) | WAL before memory | Crash safety — no silent data loss |
+| [006](docs/decisions/006-batched-wal-durability.md) | Batched WAL durability | Throughput vs bounded data loss |
 
 ---
 
@@ -244,7 +250,8 @@ PYTHONPATH=. pytest -v
 | `test_replication.py` | get_nodes(), fan-out writes, replica failure | 14 |
 | `test_health_checker.py` | Mark-down, background loop, read fallback | 11 |
 | `test_leader_promotion.py` | Write-leader selection, all-down 503, snapshot() | 9 |
-| `test_chaos.py` | Real in-process servers: crash/recover/sync | 4 |
+| `test_versioning.py` | Version counters, WAL replay, sync merge, relaxed WAL | 11 |
+| `test_chaos.py` | Real in-process servers: crash/recover/sync/versions | 12 |
 | `test_api.py` | FastAPI endpoint integration | 5 |
 
 ---
@@ -258,6 +265,7 @@ PYTHONPATH=. pytest -v
 | `PEERS` | — | Comma-separated URLs of ALL nodes including self |
 | `REPLICATION_FACTOR` | `2` | How many nodes store each key |
 | `DATA_DIR` | `data` | Directory for WAL files |
+| `DURABILITY` | `strict` | `strict` (fsync per write) or `relaxed` (batch every 100ms) |
 
 ---
 
@@ -306,3 +314,24 @@ distributed-kv-store/
 | 5 | Heartbeat failure detection + replica reads | ✅ |
 | 6 | Leader promotion + sync-on-rejoin + chaos tests | ✅ |
 | 7 | ADRs + benchmarks + observability + README polish | ✅ |
+| 8 | Version counters, batched WAL, expanded chaos tests, DESIGN.md | ✅ |
+
+---
+
+## Known Limitations (Brutally Honest)
+
+This project demonstrates distributed systems concepts. Here's what it does **NOT** do:
+
+| Limitation | Why it matters | What production systems do |
+|-----------|---------------|---------------------------|
+| **No consensus (Raft/Paxos)** | Split-brain window of ~5s where two nodes may both accept writes to the same key | etcd/ZooKeeper provide linearizable leader election |
+| **Last-writer-wins only** | Concurrent writes to the same key on different nodes → one silently overwrites the other | Vector clocks (Dynamo), CRDTs (Riak), or multi-version concurrency control |
+| **No read-your-writes guarantee** | Write to node-0, immediately read from node-1 → may get stale data | Sticky sessions, read-after-write tokens, or quorum reads |
+| **Full snapshot sync** | Rejoining node downloads the **entire** keyspace from a peer | Merkle trees (Dynamo) or log-based incremental sync (Kafka) |
+| **Single-threaded per node** | Python's GIL + single asyncio event loop limits vertical scaling | Go/Rust with thread-per-core, or separate I/O threads |
+| **No TTL / eviction** | Memory grows unbounded — no expiration policy | LRU eviction, TTL per key (Redis), or tiered storage |
+| **JSON WAL format** | Human-readable but ~5× larger than binary; no checksums | Binary WAL with CRC32 checksums (SQLite, RocksDB) |
+| **No authentication** | Any client can read/write any key | mTLS, API keys, or RBAC |
+| **In-memory only** | All data must fit in RAM | LSM trees (RocksDB), B-trees (SQLite), or memory-mapped files |
+
+> These are **intentional scope boundaries**, not bugs. Each limitation maps to a well-understood production solution — a great interview discussion point.

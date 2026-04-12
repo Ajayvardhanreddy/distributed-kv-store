@@ -138,8 +138,9 @@ async def test_replicas_of_returns_n_nodes(monkeypatch):
 @pytest.mark.asyncio
 async def test_put_fans_out_to_all_replicas(monkeypatch):
     """
-    With rf=2, put() must write to BOTH the primary and one replica.
-    We mock _forward_put and verify it gets called for the remote node(s).
+    With rf=2, put() must write to leader first, then replicate to remaining
+    nodes.  We mock _forward_put (leader path) and _forward_put_versioned
+    (replica path) and verify they get called for remote nodes.
     """
     peers = ["http://localhost:8000", "http://localhost:8001",
              "http://localhost:8002"]
@@ -147,15 +148,21 @@ async def test_put_fans_out_to_all_replicas(monkeypatch):
         router, storage = await make_router(
             tmp, "node-0", peers, monkeypatch, replication_factor=2
         )
-        router._forward_put = AsyncMock(return_value=None)
+        router._forward_put = AsyncMock(return_value=1)
+        router._forward_put_versioned = AsyncMock(return_value=None)
 
         await router.put("test-key", "test-value")
 
         replication_set = router.replicas_of("test-key")
-        # The number of _forward_put calls == number of remote nodes in set
         remote_nodes = [n for n in replication_set
                         if not router.config.is_local(n)]
-        assert router._forward_put.call_count == len(remote_nodes)
+        # Either _forward_put (leader) or _forward_put_versioned (replica)
+        # was called for each remote node
+        total_remote_calls = (
+            router._forward_put.call_count
+            + router._forward_put_versioned.call_count
+        )
+        assert total_remote_calls == len(remote_nodes)
 
         await router.close(); await storage.close()
 
@@ -168,13 +175,14 @@ async def test_put_with_rf1_no_replication(monkeypatch):
             tmp, "node-0", ["http://localhost:8000"], monkeypatch,
             replication_factor=1,
         )
-        router._forward_put = AsyncMock(return_value=None)
+        router._forward_put = AsyncMock(return_value=1)
 
         await router.put("key", "value")
 
         # Single node → all local → _forward_put never called
         router._forward_put.assert_not_called()
-        assert await storage.get("key") == "value"
+        value, version = await storage.get("key")
+        assert value == "value"
 
         await router.close(); await storage.close()
 
@@ -211,7 +219,8 @@ async def test_delete_fans_out_to_replicas(monkeypatch):
 
         result = await router.delete(local_key)
         assert result is True
-        assert await storage.get(local_key) is None   # removed locally
+        value, _ = await storage.get(local_key)
+        assert value is None   # removed locally
 
         # Replica delete was forwarded for remaining nodes in replication set
         replication_set = router.replicas_of(local_key)
@@ -248,6 +257,9 @@ async def test_replica_failure_raises_runtime_error(monkeypatch):
         )
         # Make any remote forward fail
         router._forward_put = AsyncMock(
+            side_effect=RuntimeError("Peer node-1 unreachable")
+        )
+        router._forward_put_versioned = AsyncMock(
             side_effect=RuntimeError("Peer node-1 unreachable")
         )
 

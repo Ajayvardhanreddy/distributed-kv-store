@@ -1,5 +1,5 @@
 """
-Cluster-aware request router — Phase 6: Leader Promotion
+Cluster-aware request router — Phase 8: Versioned Writes
 
 Read  path (Phase 5): try replication set in order, skip down nodes.
 Write path (Phase 6): route to the first HEALTHY node in the replication
@@ -74,9 +74,9 @@ class ClusterRouter:
     # Public API (same shape as StorageEngine so main.py is unchanged)
     # ------------------------------------------------------------------
 
-    async def get(self, key: str) -> Optional[str]:
+    async def get(self, key: str) -> tuple[Optional[str], int]:
         """
-        Read with replica fallback.
+        Read with replica fallback.  Returns (value, version).
 
         Tries each node in the replication set in order (primary first).
         Skips nodes the HealthChecker has already marked down.
@@ -103,30 +103,36 @@ class ClusterRouter:
 
         raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
 
-    async def put(self, key: str, value: str) -> None:
+    async def put(self, key: str, value: str) -> int:
         """
         Write to the current write-leader + all other healthy replicas.
+        Returns the new version number.
 
-        The write-leader = first healthy node in the replication set.
-        If the ring's original primary is down, the first live replica
-        is automatically promoted — no manual intervention needed.
-
-        Fan-out to ALL healthy nodes concurrently so every live replica
-        gets the write.  Nodes that are down at write time will catch up
-        via the sync-on-rejoin anti-entropy on their next startup.
+        The write-leader decides the version (auto-increment on its
+        local StorageEngine.put()).  Replicas receive the same version
+        via put_versioned() so all copies are consistent.
         """
         owners = self.ring.get_nodes(key, n=self.replication_factor)
         leader = self._write_leader(owners)
         if leader is None:
             raise RuntimeError(f"No healthy node available for key '{key}'")
 
-        # Fan-out to ALL healthy replicas (skip known-down nodes)
-        healthy_owners = [
+        # Step 1: write to leader → get the authoritative version
+        if self.config.is_local(leader):
+            version = await self.storage.put(key, value)
+        else:
+            version = await self._forward_put(leader, key, value)
+
+        # Step 2: fan-out to remaining healthy replicas with that version
+        other_healthy = [
             n for n in owners
-            if self.health is None or self.health.is_healthy(n)
+            if n != leader and (self.health is None or self.health.is_healthy(n))
         ]
-        logger.info(f"PUT '{key}' leader={leader} healthy_replicas={healthy_owners}")
-        await self._write_all(healthy_owners, key, value, op="put")
+        if other_healthy:
+            await self._replicate(other_healthy, key, value, version)
+
+        logger.info(f"PUT '{key}' ver={version} leader={leader}")
+        return version
 
     async def delete(self, key: str) -> bool:
         """
@@ -145,7 +151,8 @@ class ClusterRouter:
             if not await self.storage.exists(key):
                 return False
         else:
-            if await self._forward_get(leader, key) is None:
+            value, _ = await self._forward_get(leader, key)
+            if value is None:
                 return False
 
         healthy_owners = [
@@ -153,11 +160,11 @@ class ClusterRouter:
             if self.health is None or self.health.is_healthy(n)
         ]
         logger.info(f"DELETE '{key}' leader={leader} healthy_replicas={healthy_owners}")
-        await self._write_all(healthy_owners, key, value=None, op="delete")
+        await self._delete_all(healthy_owners, key)
         return True
 
     async def exists(self, key: str) -> bool:
-        value = await self.get(key)
+        value, _ = await self.get(key)
         return value is not None
 
     async def local_size(self) -> int:
@@ -197,27 +204,29 @@ class ClusterRouter:
     # Fan-out helper
     # ------------------------------------------------------------------
 
-    async def _write_all(
-        self, nodes: list[str], key: str, value: Optional[str], op: str
+    async def _replicate(
+        self, nodes: list[str], key: str, value: str, version: int
     ) -> None:
         """
-        Fan-out a PUT or DELETE to every node in `nodes` concurrently.
-
-        asyncio.gather fires all coroutines at the same time and waits
-        for ALL of them. First exception cancels the rest and propagates.
+        Replicate a versioned PUT to all given nodes concurrently.
+        Replicas use put_versioned() to accept the leader's version.
         """
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
-                if op == "put":
-                    tasks.append(self.storage.put(key, value))
-                else:
-                    tasks.append(self.storage.delete(key))
+                tasks.append(self.storage.put_versioned(key, value, version))
             else:
-                if op == "put":
-                    tasks.append(self._forward_put(node_id, key, value))
-                else:
-                    tasks.append(self._forward_delete_replica(node_id, key))
+                tasks.append(self._forward_put_versioned(node_id, key, value, version))
+        await asyncio.gather(*tasks)
+
+    async def _delete_all(self, nodes: list[str], key: str) -> None:
+        """Fan-out a DELETE to every node in `nodes` concurrently."""
+        tasks = []
+        for node_id in nodes:
+            if self.config.is_local(node_id):
+                tasks.append(self.storage.delete(key))
+            else:
+                tasks.append(self._forward_delete_replica(node_id, key))
         await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------
@@ -228,27 +237,44 @@ class ClusterRouter:
         base = self.config.peer_url(node_id)
         return f"{base}/internal/kv/{key}"
 
-    async def _forward_get(self, node_id: str, key: str) -> Optional[str]:
+    async def _forward_get(self, node_id: str, key: str) -> tuple[Optional[str], int]:
         url = self._internal_url(node_id, key)
         logger.debug(f"Forwarding GET {key} → {node_id}")
         try:
             resp = await self._client.get(url)
             if resp.status_code == 404:
-                return None
+                return None, 0
             resp.raise_for_status()
-            return resp.json()["value"]
+            data = resp.json()
+            return data["value"], data.get("version", 0)
         except httpx.RequestError as e:
             logger.error(f"Forward GET failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
-    async def _forward_put(self, node_id: str, key: str, value: str) -> None:
+    async def _forward_put(self, node_id: str, key: str, value: str) -> int:
+        """Forward PUT to leader node; returns the version assigned by the leader."""
         url = self._internal_url(node_id, key)
         logger.debug(f"Forwarding PUT {key} → {node_id}")
         try:
             resp = await self._client.put(url, json={"key": key, "value": value})
             resp.raise_for_status()
+            return resp.json().get("version", 1)
         except httpx.RequestError as e:
             logger.error(f"Forward PUT failed for {key} → {node_id}: {e}")
+            raise RuntimeError(f"Peer {node_id} unreachable") from e
+
+    async def _forward_put_versioned(
+        self, node_id: str, key: str, value: str, version: int
+    ) -> None:
+        """Forward a versioned PUT to a replica node."""
+        url = self._internal_url(node_id, key)
+        try:
+            resp = await self._client.put(
+                url, json={"key": key, "value": value, "version": version}
+            )
+            resp.raise_for_status()
+        except httpx.RequestError as e:
+            logger.error(f"Forward PUT_VERSIONED failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
     async def _forward_delete(self, node_id: str, key: str) -> bool:

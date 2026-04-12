@@ -61,7 +61,8 @@ async def test_local_put_get(monkeypatch):
             tmpdir, "node-0", ["http://localhost:8000"], monkeypatch
         )
         await router.put("hello", "world")
-        assert await router.get("hello") == "world"
+        value, version = await router.get("hello")
+        assert value == "world"
         await router.close()
         await storage.close()
 
@@ -74,7 +75,8 @@ async def test_local_delete(monkeypatch):
         )
         await router.put("key", "val")
         assert await router.delete("key") is True
-        assert await router.get("key") is None
+        value, version = await router.get("key")
+        assert value is None
         await router.close()
         await storage.close()
 
@@ -147,9 +149,9 @@ async def test_forward_get_called_for_remote_key(monkeypatch):
         assert remote_key is not None, "Could not find a remote key in 500 tries"
 
         # Mock _forward_get so no real HTTP call is made
-        router._forward_get = AsyncMock(return_value="mocked-value")
+        router._forward_get = AsyncMock(return_value=("mocked-value", 1))
 
-        value = await router.get(remote_key)
+        value, version = await router.get(remote_key)
         assert value == "mocked-value"
         router._forward_get.assert_awaited_once_with(
             router.owner_of(remote_key), remote_key
@@ -174,7 +176,7 @@ async def test_forward_put_called_for_remote_key(monkeypatch):
 
         assert remote_key is not None
 
-        router._forward_put = AsyncMock(return_value=None)
+        router._forward_put = AsyncMock(return_value=1)
         await router.put(remote_key, "some-value")
         router._forward_put.assert_awaited_once_with(
             router.owner_of(remote_key), remote_key, "some-value"
