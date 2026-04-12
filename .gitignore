@@ -19,6 +19,8 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+.cursor/
+.cursorrules
 
 # Data files
 data/
@@ -28,4 +30,3 @@ data/
 # OS
 .DS_Store
 Thumbs.db
-.cursorrules
