@@ -164,7 +164,7 @@ async def test_put_routes_to_promoted_leader(monkeypatch):
 
         # Mark primary down — replica should be promoted as write target
         hc.mark_down(primary)
-        router._forward_put = AsyncMock(return_value=None)
+        router._forward_put = AsyncMock(return_value=1)
 
         await router.put(key, "value")
 
@@ -208,7 +208,10 @@ async def test_snapshot_returns_full_store():
         await storage.put("a", "1")
         await storage.put("b", "2")
         snap = await storage.snapshot()
-        assert snap == {"a": "1", "b": "2"}
+        assert snap == {
+            "a": {"value": "1", "version": 1},
+            "b": {"value": "2", "version": 1},
+        }
         await storage.close()
 
 
@@ -221,7 +224,8 @@ async def test_snapshot_is_a_copy():
         await storage.put("key", "original")
         snap = await storage.snapshot()
         snap["key"] = "mutated"   # modify the copy
-        assert await storage.get("key") == "original"   # store unchanged
+        value, version = await storage.get("key")
+        assert value == "original"   # store unchanged
         await storage.close()
 
 

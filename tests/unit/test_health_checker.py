@@ -164,8 +164,8 @@ async def test_get_reads_primary_when_healthy(monkeypatch):
         router, storage = await make_router(tmp, cfg, hc)
 
         await storage.put("key", "value")
-        result = await router.get("key")
-        assert result == "value"
+        value, version = await router.get("key")
+        assert value == "value"
 
         await router.close(); await storage.close()
 
@@ -196,10 +196,10 @@ async def test_get_falls_back_to_replica_when_primary_down(monkeypatch):
         hc.mark_down(primary)
 
         # _forward_get to replica returns a value
-        router._forward_get = AsyncMock(return_value="fallback-value")
+        router._forward_get = AsyncMock(return_value=("fallback-value", 1))
 
-        result = await router.get(remote_key)
-        assert result == "fallback-value"
+        value, version = await router.get(remote_key)
+        assert value == "fallback-value"
         # Was called with the REPLICA, not the (skipped) primary
         router._forward_get.assert_awaited_once_with(replica, remote_key)
 

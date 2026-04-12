@@ -22,8 +22,9 @@ async def test_storage_basic_put_get():
         await engine.put("key1", "value1")
         
         # Get it back
-        value = await engine.get("key1")
+        value, version = await engine.get("key1")
         assert value == "value1"
+        assert version == 1
         
         await engine.close()
 
@@ -36,8 +37,9 @@ async def test_storage_get_nonexistent():
         engine = StorageEngine(wal_path)
         await engine.initialize()
         
-        value = await engine.get("does-not-exist")
+        value, version = await engine.get("does-not-exist")
         assert value is None
+        assert version == 0
         
         await engine.close()
 
@@ -56,7 +58,7 @@ async def test_storage_delete():
         assert deleted is True
         
         # Verify it's gone
-        value = await engine.get("key1")
+        value, version = await engine.get("key1")
         assert value is None
         
         await engine.close()
@@ -133,11 +135,13 @@ async def test_storage_update():
         
         # Put initial value
         await engine.put("key1", "value1")
-        assert await engine.get("key1") == "value1"
+        val, ver = await engine.get("key1")
+        assert val == "value1" and ver == 1
         
         # Update value
         await engine.put("key1", "value2")
-        assert await engine.get("key1") == "value2"
+        val, ver = await engine.get("key1")
+        assert val == "value2" and ver == 2
         
         # Size should still be 1
         assert await engine.size() == 1
@@ -165,7 +169,7 @@ async def test_storage_concurrent_access():
         # Verify all keys exist
         assert await engine.size() == 10
         for i in range(10):
-            value = await engine.get(f"key{i}")
+            value, version = await engine.get(f"key{i}")
             assert value == f"value{i}"
         
         await engine.close()

@@ -25,7 +25,7 @@ async def test_wal_append_and_replay():
         # Replay should give us current state
         state = await wal.replay()
         assert "key1" not in state  # Was deleted
-        assert state["key2"] == "value2"
+        assert state["key2"]["value"] == "value2"
         
         await wal.close()
 
@@ -57,7 +57,7 @@ async def test_wal_multiple_puts_same_key():
         
         # Should have final value
         state = await wal.replay()
-        assert state["key1"] == "value3"
+        assert state["key1"]["value"] == "value3"
         
         await wal.close()
 
@@ -93,8 +93,8 @@ async def test_wal_corrupted_line():
         state = await wal.replay()
         
         # Should have valid entries despite corruption
-        assert state["key1"] == "value1"
-        assert state["key2"] == "value2"
+        assert state["key1"]["value"] == "value1"
+        assert state["key2"]["value"] == "value2"
         
         await wal.close()
 
@@ -114,7 +114,7 @@ async def test_wal_missing_field():
         state = await wal.replay()
         
         # Should only have the valid entry
-        assert state.get("key2") == "value2"
+        assert state["key2"]["value"] == "value2"
         assert len(state) == 1
         
         await wal.close()
@@ -134,7 +134,7 @@ async def test_wal_persistence_across_instances():
         # Second instance: replay should recover data
         wal2 = WriteAheadLog(wal_path)
         state = await wal2.replay()
-        assert state["persistent"] == "data"
+        assert state["persistent"]["value"] == "data"
         await wal2.close()
 
 
@@ -158,3 +158,4 @@ async def test_wal_format():
             assert entry["key"] == "key1"
             assert entry["value"] == "value1"
             assert "ts" in entry  # Timestamp should be present
+            assert "ver" in entry  # Version should be present

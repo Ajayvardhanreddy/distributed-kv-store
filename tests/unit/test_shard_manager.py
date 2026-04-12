@@ -36,8 +36,10 @@ async def test_shard_manager_put_get():
         await manager.put("key2", "value2")
         
         # Get them back
-        assert await manager.get("key1") == "value1"
-        assert await manager.get("key2") == "value2"
+        val1, _ = await manager.get("key1")
+        val2, _ = await manager.get("key2")
+        assert val1 == "value1"
+        assert val2 == "value2"
         
         await manager.close()
 
@@ -61,7 +63,7 @@ async def test_consistent_routing():
         await manager.put(test_key, "bob")
         assert manager.hash_ring.get_node(test_key) == shard_for_key
         
-        value = await manager.get(test_key)
+        value, _ = await manager.get(test_key)
         assert value == "bob"
         assert manager.hash_ring.get_node(test_key) == shard_for_key
         
@@ -104,7 +106,8 @@ async def test_delete_operation():
         # Put and delete
         await manager.put("key1", "value1")
         assert await manager.delete("key1") is True
-        assert await manager.get("key1") is None
+        val, _ = await manager.get("key1")
+        assert val is None
         
         # Delete nonexistent
         assert await manager.delete("does-not-exist") is False
