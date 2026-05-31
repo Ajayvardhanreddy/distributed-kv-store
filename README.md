@@ -157,7 +157,7 @@ This system makes an explicit **AP (Availability + Partition Tolerance)** choice
 The cluster ships with Prometheus + Grafana out of the box:
 
 ```bash
-docker-compose up --build
+docker compose up --build
 # Open Grafana: http://localhost:3000  (login: admin / admin)
 # Dashboard auto-loaded: "Distributed KV Store"
 ```
@@ -194,7 +194,7 @@ docker-compose up --build
 ```bash
 git clone https://github.com/Ajayvardhanreddy/distributed-kv-store.git
 cd distributed-kv-store
-docker-compose up --build
+docker compose up --build
 ```
 
 This starts 3 KV nodes (ports 8000-8002) + Prometheus (9090) + Grafana (3000).
@@ -226,17 +226,17 @@ curl -X PUT http://localhost:8001/kv/order:1 \
 ## Running Tests
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+# Install dependencies (creates .venv automatically)
+uv sync --group dev
 
 # Unit + API tests (fast, ~1s)
-PYTHONPATH=. pytest tests/unit/ tests/test_api.py -v
+uv run pytest tests/unit/ tests/test_api.py -v
 
-# Chaos tests (real servers, ~20s)  
-PYTHONPATH=. pytest tests/integration/test_chaos.py -v
+# Chaos tests (real servers, ~20s)
+uv run pytest tests/integration/test_chaos.py -v
 
 # Everything
-PYTHONPATH=. pytest -v
+uv run pytest
 ```
 
 ### Test coverage by file
@@ -244,7 +244,7 @@ PYTHONPATH=. pytest -v
 | File | What it tests | Count |
 |------|--------------|-------|
 | `test_storage.py` | StorageEngine CRUD, concurrency | 8 |
-| `test_wal.py` | WAL append/replay, corruption handling | 8 |
+| `test_wal.py` | WAL append/replay, binary format, CRC, migration | 14 |
 | `test_consistent_hash.py` | Ring distribution, minimal rebalancing | 8 |
 | `test_cluster_router.py` | Forwarding, unreachable peer handling | 8 |
 | `test_replication.py` | get_nodes(), fan-out writes, replica failure | 14 |
@@ -297,7 +297,8 @@ distributed-kv-store/
 │       └── test_chaos.py        # Fault-injection with real servers
 ├── docker-compose.yml           # 3 KV nodes + Prometheus + Grafana
 ├── Dockerfile
-└── requirements.txt
+├── pyproject.toml               # Dependencies (uv)
+└── uv.lock                      # Locked dependency versions
 ```
 
 ---
