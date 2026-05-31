@@ -5,9 +5,9 @@ version: "3.9"
 # forwards the request to the correct peer automatically.
 #
 # Usage:
-#   docker-compose up --build       # start all 3 nodes + monitoring
-#   docker-compose up node-0        # start only node-0
-#   docker-compose logs -f          # tail all logs
+#   docker compose up --build          # start all 3 nodes + monitoring
+#   docker compose up node-0           # start only node-0
+#   docker compose logs -f             # tail all logs
 #
 # Monitoring:
 #   Prometheus:  http://localhost:9090
@@ -21,19 +21,20 @@ services:
       - "8000:8000"
     environment:
       NODE_ID: node-0
-      NODE_PORT: 8000
-      # All 3 peers (including self). node-X name resolves inside Docker network.
+      NODE_PORT: "8000"
       PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
       DATA_DIR: /app/data
       REPLICATION_FACTOR: "2"
+      DURABILITY: strict
     volumes:
       - ./data/node-0:/app/data
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 5s
     networks:
       - kv-net
 
@@ -43,18 +44,20 @@ services:
       - "8001:8001"
     environment:
       NODE_ID: node-1
-      NODE_PORT: 8001
+      NODE_PORT: "8001"
       PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
       DATA_DIR: /app/data
       REPLICATION_FACTOR: "2"
+      DURABILITY: strict
     volumes:
       - ./data/node-1:/app/data
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    command: ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 5s
     networks:
       - kv-net
 
@@ -64,24 +67,26 @@ services:
       - "8002:8002"
     environment:
       NODE_ID: node-2
-      NODE_PORT: 8002
+      NODE_PORT: "8002"
       PEERS: "http://node-0:8000,http://node-1:8001,http://node-2:8002"
       DATA_DIR: /app/data
       REPLICATION_FACTOR: "2"
+      DURABILITY: strict
     volumes:
       - ./data/node-2:/app/data
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8002
+    command: ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8002"]
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8002/health" ]
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 5s
     networks:
       - kv-net
 
-  # -----------------------------------------------------------------------
+  # -------------------------------------------------------------------------
   # Observability stack
-  # -----------------------------------------------------------------------
+  # -------------------------------------------------------------------------
 
   prometheus:
     image: prom/prometheus:v2.51.0

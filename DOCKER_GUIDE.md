@@ -1,384 +1,117 @@
-# Docker Guide: Building and Running Your KV Store
+# Docker Guide: Building and Running the KV Store
 
-This guide explains how to use Docker for this project, from basics to common workflows.
+## Key Components
 
-## 📚 What is Docker?
-
-**Docker** packages your application with all its dependencies into isolated "containers" that run consistently anywhere. Think of it like a lightweight virtual machine.
-
-### Key Components We Use
-
-1. **Dockerfile** - Recipe for building your application image
-2. **docker-compose.yml** - Configuration for running containers (including multi-node setups later)
-3. **Docker Image** - Executable package built from Dockerfile
-4. **Docker Container** - Running instance of an image
+1. **Dockerfile** — builds the app image using `uv` for fast, reproducible installs
+2. **docker-compose.yml** — runs the full 3-node cluster + Prometheus + Grafana
+3. **pyproject.toml + uv.lock** — dependency manifest and lockfile (replaces `requirements.txt`)
 
 ---
 
-## 🔧 Step-by-Step: Building and Running
+## Quick Start
 
-### Step 1: Build the Docker Image
-
-**Command:**
 ```bash
-docker-compose build
+# Build and start the full cluster (3 nodes + monitoring)
+docker compose up --build
+
+# Or in detached mode
+docker compose up --build -d
 ```
 
-**What it does:**
-- Reads `Dockerfile` and `docker-compose.yml`
-- Downloads Python 3.11-slim base image (if not cached)
-- Installs all dependencies from `requirements.txt`
-- Copies your application code into the image
-- Creates a reusable image named `distributed-kv-store-kv-node`
-
-**When to run:**
-- First time setting up
-- After changing `Dockerfile` or `requirements.txt`
-- After adding new Python dependencies
-
-**Output you'll see:**
-```
-[+] Building 4.0s (13/13) FINISHED
- => [1/5] FROM docker.io/library/python:3.11-slim
- => [2/5] WORKDIR /app
- => [3/5] COPY requirements.txt .
- => [4/5] RUN pip install --no-cache-dir -r requirements.txt
- => [5/5] COPY app/ ./app/
- => exporting to image
-```
+Nodes are available at:
+- Node-0: http://localhost:8000
+- Node-1: http://localhost:8001
+- Node-2: http://localhost:8002
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (admin / admin)
 
 ---
 
-### Step 2: Start the Container
+## Common Workflows
 
-**Command:**
+### Test the cluster
+
 ```bash
-docker-compose up
-```
-
-**What it does:**
-- Creates a new container from your image
-- Maps port 8000 (container) → 8000 (your machine)
-- Mounts volumes for live code reload
-- Starts uvicorn server inside the container
-
-**Flags:**
-- `docker-compose up` - Run in foreground (see logs in terminal)
-- `docker-compose up -d` - Run in background/detached mode
-
-**Output you'll see:**
-```
-[+] Running 1/1
- ✔ Container distributed-kv-store-kv-node-1 Started
-INFO:     Started server process [1]
-INFO:     Uvicorn running on http://0.0.0.0:8000
-```
-
----
-
-### Step 3: Test the Running Container
-
-**Health check:**
-```bash
+# Health check
 curl http://localhost:8000/health
-```
 
-**Expected:**
-```json
-{"status":"healthy","node_id":"node-1","keys_stored":0}
-```
-
-**Store a value:**
-```bash
+# Write a key (replicated to 2 nodes)
 curl -X PUT http://localhost:8000/kv/mykey \
   -H "Content-Type: application/json" \
   -d '{"key":"mykey","value":"hello from Docker!"}'
+
+# Read from any node
+curl http://localhost:8001/kv/mykey
+
+# Cluster-wide health view
+curl http://localhost:8000/cluster/health | python3 -m json.tool
 ```
 
-**Retrieve it:**
+### View logs
+
 ```bash
-curl http://localhost:8000/kv/mykey
+docker compose logs -f            # all services
+docker compose logs -f node-0     # single node
+docker compose logs --tail=50     # last 50 lines
 ```
 
-**Expected:**
-```json
-{"value":"hello from Docker!"}
+### Stop and clean up
+
+```bash
+docker compose down               # stop containers, keep volumes
+docker compose down -v            # stop + delete WAL data (destructive)
+docker system prune               # reclaim disk space from unused images
+```
+
+### Rebuild after dependency changes
+
+Whenever `pyproject.toml` or `uv.lock` changes, rebuild the image:
+
+```bash
+docker compose up --build
+```
+
+The Dockerfile copies `pyproject.toml` and `uv.lock` before the app code, so layer caching means dependency installs are only re-run when those files change — not on every code edit.
+
+---
+
+## How the Dockerfile Works
+
+```dockerfile
+# 1. Copy uv binary from official image (no separate install step)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# 2. Copy only dependency files first (cached layer)
+COPY pyproject.toml uv.lock ./
+
+# 3. Install production deps with exact locked versions
+RUN uv sync --no-group dev --frozen --no-install-project
+
+# 4. Copy app code (separate layer — invalidated only on code changes)
+COPY app/ ./app/
 ```
 
 ---
 
-### Step 4: View Logs
+## Troubleshooting
 
-**See container logs:**
+**Port already in use**
 ```bash
-docker-compose logs
+lsof -i :8000   # find what's using the port
+# change the host port in docker-compose.yml if needed
 ```
 
-**Follow logs in real-time:**
+**Container won't start — check logs**
 ```bash
-docker-compose logs -f
+docker compose logs node-0
 ```
 
-**See last 50 lines:**
+**Clear build cache and rebuild from scratch**
 ```bash
-docker-compose logs --tail=50
+docker compose build --no-cache
 ```
 
----
-
-### Step 5: Stop the Container
-
-**Stop and remove containers:**
+**Shell into a running node**
 ```bash
-docker-compose down
+docker compose exec node-0 /bin/bash
 ```
-
-**What it does:**
-- Stops running containers
-- Removes containers (but keeps images)
-- Removes networks created by compose
-
-**Note:** Your data in volumes (`./data`) persists!
-
----
-
-## 🔄 Common Docker Workflows
-
-### Development Workflow (Live Reload)
-
-Thanks to volume mounts in `docker-compose.yml`, code changes are reflected immediately:
-
-**Terminal 1:**
-```bash
-docker-compose up
-```
-
-**Terminal 2 - Edit code:**
-```bash
-# Edit app/main.py in your editor
-# Uvicorn auto-reloads when it detects changes
-```
-
-**Important:** Volume mounts only work for file changes, not dependency changes. If you modify `requirements.txt`, rebuild:
-```bash
-docker-compose down
-docker-compose build
-docker-compose up
-```
-
----
-
-### Rebuild After Changes
-
-**When to rebuild:**
-- Changed `requirements.txt`
-- Changed `Dockerfile`
-- Added new Python packages
-
-**Quick rebuild and restart:**
-```bash
-docker-compose down
-docker-compose build
-docker-compose up -d
-```
-
-**Or in one command:**
-```bash
-docker-compose up --build -d
-```
-
----
-
-### Check Container Status
-
-**See running containers:**
-```bash
-docker ps
-```
-
-**See all containers (including stopped):**
-```bash
-docker ps -a
-```
-
-**See images:**
-```bash
-docker images
-```
-
----
-
-### Execute Commands Inside Container
-
-**Open a shell inside the running container:**
-```bash
-docker-compose exec kv-node /bin/bash
-```
-
-**Run a one-off command:**
-```bash
-docker-compose exec kv-node python -c "print('Hello from inside container')"
-```
-
-**Run tests inside container:**
-```bash
-docker-compose exec kv-node pytest -v
-```
-
----
-
-### Clean Up
-
-**Remove containers and networks:**
-```bash
-docker-compose down
-```
-
-**Remove everything including volumes (⚠️ deletes WAL data):**
-```bash
-docker-compose down -v
-```
-
-**Remove unused images and free disk space:**
-```bash
-docker system prune
-```
-
-**Remove specific image:**
-```bash
-docker rmi distributed-kv-store-kv-node
-```
-
----
-
-## 📁 Understanding Volume Mounts
-
-In `docker-compose.yml`:
-
-```yaml
-volumes:
-  - ./app:/app/app        # Live reload for code
-  - ./data:/app/data      # Persistent WAL storage
-```
-
-**What this means:**
-- Changes to files in `./app` on your machine are immediately visible in `/app/app` inside the container
-- Data written to `/app/data` inside the container is saved to `./data` on your machine
-- Even if you delete the container, `./data` survives
-
----
-
-## 🔍 Troubleshooting
-
-### Port already in use
-
-**Error:** `Bind for 0.0.0.0:8000 failed: port is already allocated`
-
-**Fix:**
-```bash
-# Find what's using port 8000
-lsof -i :8000
-
-# Kill the process or change port in docker-compose.yml
-ports:
-  - "8001:8000"  # Use 8001 on host instead
-```
-
----
-
-### Container won't start
-
-**Check logs:**
-```bash
-docker-compose logs
-```
-
-**Common issues:**
-- Syntax error in Python code
-- Missing dependencies (rebuild image)
-- Port conflict (see above)
-
----
-
-### Image build fails
-
-**Clear cache and rebuild:**
-```bash
-docker-compose build --no-cache
-```
-
----
-
-### Changes not reflecting
-
-**If code changes aren't appearing:**
-1. Make sure you're editing files in `./app`, not inside the container
-2. Check volume mounts in `docker-compose.yml`
-3. Restart container: `docker-compose restart`
-
----
-
-## 🚀 Phase 1 Preview: Multi-Node Setup
-
-In Phase 3, `docker-compose.yml` will look like this:
-
-```yaml
-services:
-  kv-node-1:
-    build: .
-    ports: ["8001:8000"]
-    environment:
-      - NODE_ID=node-1
-      
-  kv-node-2:
-    build: .
-    ports: ["8002:8000"]
-    environment:
-      - NODE_ID=node-2
-      
-  kv-node-3:
-    build: .
-    ports: ["8003:8000"]
-    environment:
-      - NODE_ID=node-3
-```
-
-**Start 3 nodes:**
-```bash
-docker-compose up -d
-```
-
-**Access different nodes:**
-```bash
-curl http://localhost:8001/health  # node-1
-curl http://localhost:8002/health  # node-2
-curl http://localhost:8003/health  # node-3
-```
-
----
-
-## 📝 Quick Reference
-
-| Task | Command |
-|------|---------|
-| Build image | `docker-compose build` |
-| Start containers | `docker-compose up -d` |
-| View logs | `docker-compose logs -f` |
-| Stop containers | `docker-compose down` |
-| Rebuild & restart | `docker-compose up --build -d` |
-| Shell into container | `docker-compose exec kv-node /bin/bash` |
-| Run tests | `docker-compose exec kv-node pytest -v` |
-| Check status | `docker ps` |
-| Clean up | `docker system prune` |
-
----
-
-## 🎓 Key Takeaways
-
-1. **Docker = Consistency** - Same environment on dev, test, and prod
-2. **Images are templates** - Containers are running instances
-3. **Volume mounts** - Enable live development and data persistence
-4. **docker-compose** - Simplifies multi-container orchestration
-5. **Rebuild when needed** - Dependency changes require rebuilding the image
-
-You're now ready to use Docker for development and testing!

@@ -1,0 +1,41 @@
+[project]
+name = "distributed-kv-store"
+version = "0.8.0"
+description = "Fault-tolerant distributed in-memory key-value store"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    # Web framework
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "pydantic>=2.0.0",
+    # Async I/O
+    "aiofiles>=23.0.0",
+    # Binary WAL serialisation (Phase 1)
+    "msgpack>=1.0.0",
+    # Observability
+    "prometheus-fastapi-instrumentator>=6.0.0",
+    # HTTP client (cluster routing + tests)
+    "httpx>=0.24.0",
+    # Docker health checks
+    "psutil>=5.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "matplotlib>=3.8.0",
+]
+
+[tool.uv]
+# App — not a library; skip building/installing the project itself as a wheel
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
