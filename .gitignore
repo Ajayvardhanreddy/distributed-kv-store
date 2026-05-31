@@ -22,9 +22,13 @@ htmlcov/
 .cursor/
 .cursorrules
 
+# uv — lock file is committed; cache is not
+.uv/
+
 # Data files
 data/
 *.wal
+*.wal.bak
 *.log
 
 # OS
