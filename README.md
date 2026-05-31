@@ -235,9 +235,11 @@ uv run pytest tests/unit/ tests/test_api.py -v
 # Chaos tests (real servers, ~20s)
 uv run pytest tests/integration/test_chaos.py -v
 
-# Everything
+# Full suite
 uv run pytest
 ```
+
+> To run the cluster itself, use Docker — see [Running Locally](#running-locally).
 
 ### Test coverage by file
 
