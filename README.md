@@ -157,7 +157,7 @@ This system makes an explicit **AP (Availability + Partition Tolerance)** choice
 The cluster ships with Prometheus + Grafana out of the box:
 
 ```bash
-docker compose up --build
+docker compose up --build -d && docker image prune -f
 # Open Grafana: http://localhost:3000  (login: admin / admin)
 # Dashboard auto-loaded: "Distributed KV Store"
 ```
@@ -194,7 +194,7 @@ docker compose up --build
 ```bash
 git clone https://github.com/Ajayvardhanreddy/distributed-kv-store.git
 cd distributed-kv-store
-docker compose up --build
+docker compose up --build -d && docker image prune -f
 ```
 
 This starts 3 KV nodes (ports 8000-8002) + Prometheus (9090) + Grafana (3000).
