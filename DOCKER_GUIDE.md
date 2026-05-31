@@ -11,11 +11,8 @@
 ## Quick Start
 
 ```bash
-# Build and start the full cluster (3 nodes + monitoring)
-docker compose up --build
-
-# Or in detached mode
-docker compose up --build -d
+# Build, start detached, and clean up dangling images in one shot
+docker compose up --build -d && docker image prune -f
 ```
 
 Nodes are available at:
@@ -68,7 +65,7 @@ docker system prune               # reclaim disk space from unused images
 Whenever `pyproject.toml` or `uv.lock` changes, rebuild the image:
 
 ```bash
-docker compose up --build
+docker compose up --build -d && docker image prune -f
 ```
 
 The Dockerfile copies `pyproject.toml` and `uv.lock` before the app code, so layer caching means dependency installs are only re-run when those files change — not on every code edit.
