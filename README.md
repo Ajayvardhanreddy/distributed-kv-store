@@ -305,22 +305,6 @@ distributed-kv-store/
 
 ---
 
-## Phase Roadmap
-
-| Phase | Feature | Status |
-|-------|---------|--------|
-| 0 | Project setup, Docker, CI | ✅ |
-| 1 | Single-node core + WAL durability | ✅ |
-| 2 | Consistent hashing + virtual nodes | ✅ |
-| 3 | Multi-node cluster + HTTP forwarding | ✅ |
-| 4 | Synchronous replication (write fan-out) | ✅ |
-| 5 | Heartbeat failure detection + replica reads | ✅ |
-| 6 | Leader promotion + sync-on-rejoin + chaos tests | ✅ |
-| 7 | ADRs + benchmarks + observability + README polish | ✅ |
-| 8 | Version counters, batched WAL, expanded chaos tests, DESIGN.md | ✅ |
-
----
-
 ## Known Limitations (Brutally Honest)
 
 This project demonstrates distributed systems concepts. Here's what it does **NOT** do:
