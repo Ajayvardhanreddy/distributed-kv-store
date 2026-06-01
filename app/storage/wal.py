@@ -204,6 +204,7 @@ class WriteAheadLog:
         key: str,
         value: Optional[str] = None,
         version: int = 0,
+        tombstone_expires_at: Optional[float] = None,
     ) -> None:
         payload: dict = {
             "schema_version": 1,
@@ -214,6 +215,8 @@ class WriteAheadLog:
         }
         if value is not None:
             payload["value"] = value
+        if tombstone_expires_at is not None:
+            payload["tombstone_expires_at"] = tombstone_expires_at
 
         record = _encode_record(payload)
 
@@ -291,9 +294,20 @@ class WriteAheadLog:
         ver = entry.get("ver", 1)
 
         if op == "PUT":
-            state[key] = {"value": entry.get("value", ""), "version": ver}
+            state[key] = {
+                "value": entry.get("value", ""),
+                "version": ver,
+                "deleted": False,
+            }
         elif op == "DELETE":
-            state.pop(key, None)
+            # Phase 2: DELETE produces a tombstone, never a physical removal.
+            # tombstone_expires_at may be absent in very old records — default far future.
+            expires = entry.get("tombstone_expires_at", time.time() + 86400)
+            state[key] = {
+                "deleted": True,
+                "version": ver,
+                "tombstone_expires_at": expires,
+            }
         else:
             logger.warning(f"WAL: unknown op '{op}' for key '{key}' — skipped")
 

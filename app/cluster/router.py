@@ -136,31 +136,42 @@ class ClusterRouter:
 
     async def delete(self, key: str) -> bool:
         """
-        Delete from all healthy nodes in the replication set.
+        Write a tombstone on the write-leader then fan-out to healthy replicas.
 
-        Existence is checked on the write-leader (not necessarily the
-        original ring primary).  Returns True only if the key existed.
+        All replicas receive the same (version, tombstone_expires_at) so every
+        copy is identical — prevents version skew during sync-on-rejoin.
+        Returns True if the key existed (was live), False otherwise.
         """
         owners = self.ring.get_nodes(key, n=self.replication_factor)
         leader = self._write_leader(owners)
         if leader is None:
             raise RuntimeError(f"No healthy node available for key '{key}'")
 
-        # Check existence on the current write-leader
+        # Step 1: write tombstone on the leader → get the authoritative version
         if self.config.is_local(leader):
-            if not await self.storage.exists(key):
+            existed = await self.storage.delete(key)
+            if not existed:
                 return False
+            # Read the tombstone data the engine just wrote
+            ts_entry = self.storage.store.get(key, {})
+            version = ts_entry["version"]
+            tombstone_expires_at = ts_entry["tombstone_expires_at"]
         else:
-            value, _ = await self._forward_get(leader, key)
-            if value is None:
+            result = await self._forward_delete(leader, key)
+            if result is None:
                 return False
+            version = result["version"]
+            tombstone_expires_at = result["tombstone_expires_at"]
 
-        healthy_owners = [
+        # Step 2: fan-out tombstone (with leader's version) to other live replicas
+        other_healthy = [
             n for n in owners
-            if self.health is None or self.health.is_healthy(n)
+            if n != leader and (self.health is None or self.health.is_healthy(n))
         ]
-        logger.info(f"DELETE '{key}' leader={leader} healthy_replicas={healthy_owners}")
-        await self._delete_all(healthy_owners, key)
+        if other_healthy:
+            await self._replicate_tombstone(other_healthy, key, version, tombstone_expires_at)
+
+        logger.info(f"DELETE '{key}' tombstone ver={version} leader={leader}")
         return True
 
     async def exists(self, key: str) -> bool:
@@ -207,10 +218,7 @@ class ClusterRouter:
     async def _replicate(
         self, nodes: list[str], key: str, value: str, version: int
     ) -> None:
-        """
-        Replicate a versioned PUT to all given nodes concurrently.
-        Replicas use put_versioned() to accept the leader's version.
-        """
+        """Replicate a versioned PUT to all given nodes concurrently."""
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
@@ -219,14 +227,20 @@ class ClusterRouter:
                 tasks.append(self._forward_put_versioned(node_id, key, value, version))
         await asyncio.gather(*tasks)
 
-    async def _delete_all(self, nodes: list[str], key: str) -> None:
-        """Fan-out a DELETE to every node in `nodes` concurrently."""
+    async def _replicate_tombstone(
+        self, nodes: list[str], key: str, version: int, tombstone_expires_at: float
+    ) -> None:
+        """Fan-out a tombstone (with leader-assigned version) to replica nodes."""
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
-                tasks.append(self.storage.delete(key))
+                tasks.append(
+                    self.storage.put_tombstone(key, version, tombstone_expires_at)
+                )
             else:
-                tasks.append(self._forward_delete_replica(node_id, key))
+                tasks.append(
+                    self._forward_tombstone(node_id, key, version, tombstone_expires_at)
+                )
         await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------
@@ -277,30 +291,41 @@ class ClusterRouter:
             logger.error(f"Forward PUT_VERSIONED failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
-    async def _forward_delete(self, node_id: str, key: str) -> bool:
-        """Delete from a remote node; used for the primary-only path."""
+    async def _forward_delete(self, node_id: str, key: str) -> Optional[dict]:
+        """
+        Forward DELETE to the leader node.
+
+        Returns {"version": int, "tombstone_expires_at": float} on success,
+        None if the key did not exist on the leader (404).
+        """
         url = self._internal_url(node_id, key)
         logger.debug(f"Forwarding DELETE {key} → {node_id}")
         try:
             resp = await self._client.delete(url)
             if resp.status_code == 404:
-                return False
+                return None
             resp.raise_for_status()
-            return True
+            data = resp.json()
+            return {
+                "version": data["version"],
+                "tombstone_expires_at": data["tombstone_expires_at"],
+            }
         except httpx.RequestError as e:
             logger.error(f"Forward DELETE failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
-    async def _forward_delete_replica(self, node_id: str, key: str) -> None:
-        """
-        Delete from a replica node during fan-out.
-        404 is treated as OK (replica may never have had the key).
-        """
-        url = self._internal_url(node_id, key)
+    async def _forward_tombstone(
+        self, node_id: str, key: str, version: int, tombstone_expires_at: float
+    ) -> None:
+        """Apply a tombstone on a replica node (fan-out path)."""
+        base = self.config.peer_url(node_id)
+        url = f"{base}/internal/tombstone/{key}"
         try:
-            resp = await self._client.delete(url)
-            if resp.status_code not in (200, 404):
-                resp.raise_for_status()
+            resp = await self._client.post(
+                url,
+                json={"version": version, "tombstone_expires_at": tombstone_expires_at},
+            )
+            resp.raise_for_status()
         except httpx.RequestError as e:
-            logger.error(f"Replica DELETE failed for {key} → {node_id}: {e}")
+            logger.error(f"Forward tombstone failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e

@@ -21,17 +21,20 @@ from app.storage.wal import WriteAheadLog, MAGIC, FORMAT_VERSION, RECORD_HEADER_
 
 @pytest.mark.asyncio
 async def test_wal_append_and_replay():
-    """Basic append and replay returns correct final state."""
+    """Basic append and replay returns correct final state.
+    Phase 2: DELETE produces a tombstone entry, not a removal.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "test.wal")
         wal = WriteAheadLog(wal_path)
 
         await wal.append("PUT", "key1", "value1")
         await wal.append("PUT", "key2", "value2")
-        await wal.append("DELETE", "key1")
+        await wal.append("DELETE", "key1", tombstone_expires_at=9999999999.0)
 
         state = await wal.replay()
-        assert "key1" not in state
+        # Phase 2: key1 is a tombstone, not absent
+        assert state["key1"]["deleted"] is True
         assert state["key2"]["value"] == "value2"
 
         await wal.close()
@@ -65,12 +68,15 @@ async def test_wal_multiple_puts_same_key():
 
 @pytest.mark.asyncio
 async def test_wal_delete_nonexistent():
+    """Phase 2: DELETE in WAL always produces a tombstone on replay,
+    even for keys that were never PUT (idempotent / safe)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "test.wal")
         wal = WriteAheadLog(wal_path)
-        await wal.append("DELETE", "nonexistent")
+        await wal.append("DELETE", "nonexistent", tombstone_expires_at=9999999999.0)
         state = await wal.replay()
-        assert state == {}
+        assert "nonexistent" in state
+        assert state["nonexistent"]["deleted"] is True
         await wal.close()
 
 
