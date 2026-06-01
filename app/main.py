@@ -1,17 +1,21 @@
 """
-Distributed Key-Value Store - Main FastAPI Application  (Phase 8)
+Distributed Key-Value Store — FastAPI application (Phase 2: Tombstone DELETEs)
 
-Each instance is one node in an N-node cluster.  Every node:
-  • Owns one local shard (1 StorageEngine, 1 WAL file)
-  • Knows all peer nodes via the PEERS env var
-  • Routes every public request via ClusterRouter (may forward to peer)
-  • Exposes /internal/kv/* for peer-to-peer writes (no re-forwarding)
-  • Runs a background HealthChecker that pings peers every 5 s
-  • Falls back to replicas when the primary is down (Phase 5)
+Each node:
+  • Owns one local StorageEngine + WAL file
+  • Routes all public requests via ClusterRouter
+  • Exposes /internal/* endpoints for peer-to-peer writes (no re-forwarding)
+  • Runs a HealthChecker background loop (peer heartbeats)
+  • Runs a Compaction background loop (physical tombstone removal)
+  • Performs sync-on-rejoin at startup (pulls missing keys AND tombstones from peers)
 """
-from contextlib import asynccontextmanager
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
@@ -34,83 +38,106 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Globals  (initialised in lifespan)
+# Globals (initialised in lifespan)
 # ---------------------------------------------------------------------------
 config: NodeConfig = None
 router: ClusterRouter = None
 health: HealthChecker = None
 
+# Compaction interval — how often expired tombstones are physically removed
+_COMPACT_INTERVAL_SECONDS = 300.0  # 5 minutes
+
 
 # ---------------------------------------------------------------------------
-# Lifespan – startup / shutdown
+# Background compaction loop
 # ---------------------------------------------------------------------------
+
+async def _compact_loop(storage: StorageEngine, interval: float) -> None:
+    """Periodically remove tombstones that have passed tombstone_expires_at."""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            removed = await storage.compact()
+            if removed:
+                logger.info(f"Compaction: removed {removed} expired tombstones")
+    except asyncio.CancelledError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Lifespan — startup / shutdown
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global config, router, health
 
-    # 1. Load node identity and peer list from environment
     config = NodeConfig()
 
-    # 2. Build consistent hash ring (same on every node — deterministic)
     ring = ConsistentHashRing(num_vnodes=150)
     for node_id in config.node_ids:
         ring.add_node(node_id)
 
-    # 3. Local storage: one WAL file per node
     wal_path = os.path.join(config.data_dir, f"{config.node_id}.wal")
-    storage = StorageEngine(wal_path, durability=config.durability)
+    storage = StorageEngine(
+        wal_path,
+        durability=config.durability,
+        tombstone_retention_seconds=config.tombstone_retention_seconds,
+    )
     await storage.initialize()
-    # Start background WAL flush loop (only active in relaxed mode)
     await storage.wal.start_flush_loop()
 
-    local_keys = await storage.size()
+    live = await storage.size()
     logger.info(
-        f"✅ Node '{config.node_id}' started | "
-        f"peers={config.node_ids} | rf={config.replication_factor} | "
-        f"local_keys={local_keys}"
+        f"✅ Node '{config.node_id}' started | peers={config.node_ids} | "
+        f"rf={config.replication_factor} | live_keys={live}"
     )
 
-    # 4. Start health checker (background ping loop)
     health = HealthChecker(config)
     await health.start()
 
-    # 5. Wire up the cluster router, injecting the health checker
     router = ClusterRouter(config, storage, ring, health=health)
     await router.initialize()
 
-    # 6. Anti-entropy: sync missing keys from a live peer on startup.
-    #    This ensures a rejoining node catches up on writes it missed
-    #    while it was down — closing the stale-replica gap.
     await sync_from_peers(config, storage)
+
+    # Start background compaction
+    compact_task = asyncio.create_task(
+        _compact_loop(storage, _COMPACT_INTERVAL_SECONDS)
+    )
 
     yield
 
-    # Shutdown — stop background tasks before closing storage
+    compact_task.cancel()
+    try:
+        await compact_task
+    except asyncio.CancelledError:
+        pass
+
     await health.stop()
     await router.close()
     await storage.close()
     logger.info(f"✅ Node '{config.node_id}' shut down")
 
+
 # ---------------------------------------------------------------------------
-# Anti-entropy helper — sync-on-rejoin
+# Anti-entropy — sync-on-rejoin
 # ---------------------------------------------------------------------------
 
 async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
     """
-    Pull missing or stale keys from the first reachable peer on startup.
+    Pull missing or stale keys (and tombstones) from the first reachable peer.
 
-    Strategy (version-aware anti-entropy):
-      1. Try each peer until one responds to GET /internal/sync
-      2. For every key in the peer's snapshot:
-         - If we don't have the key → accept it
-         - If we have it but peer has a higher version → accept theirs
-         - Otherwise → keep ours (our WAL-replayed state takes precedence)
-      3. Log how many keys were synced
+    Merge rules (version wins):
+      - peer_version > local_version AND peer entry is live  → put_versioned()
+      - peer_version > local_version AND peer entry is tombstone → put_tombstone()
+      - peer_version <= local_version → keep ours (already up-to-date)
+
+    Carrying tombstones prevents key resurrection: if a key was deleted while
+    this node was offline, the tombstone will suppress the stale WAL value.
     """
     peers_to_try = [
-        (nid, url)
-        for nid, url in cfg.peers.items()
-        if not cfg.is_local(nid)
+        (nid, url) for nid, url in cfg.peers.items() if not cfg.is_local(nid)
     ]
     if not peers_to_try:
         logger.info("Sync-on-rejoin: single-node cluster, nothing to sync")
@@ -124,19 +151,29 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
                     continue
                 peer_data: dict = resp.json().get("keys", {})
                 synced = 0
-                for key, entry in peer_data.items():
-                    peer_value = entry.get("value", entry) if isinstance(entry, dict) else entry
-                    peer_version = entry.get("version", 1) if isinstance(entry, dict) else 1
 
-                    local_value, local_version = await storage.get(key)
-                    if local_value is None or peer_version > local_version:
-                        await storage.put_versioned(key, peer_value, peer_version)
-                        synced += 1
+                for key, entry in peer_data.items():
+                    if not isinstance(entry, dict):
+                        continue
+
+                    peer_version = entry.get("version", 1)
+                    local_version = await storage.get_version(key)
+
+                    if peer_version <= local_version:
+                        continue  # our version is at least as recent
+
+                    if entry.get("deleted"):
+                        expires = entry.get("tombstone_expires_at", time.time() + 86400)
+                        await storage.put_tombstone(key, peer_version, expires)
+                    else:
+                        await storage.put_versioned(key, entry["value"], peer_version)
+                    synced += 1
+
                 logger.info(
                     f"Sync-on-rejoin: pulled {synced}/{len(peer_data)} "
-                    f"keys from {node_id}"
+                    f"entries from {node_id}"
                 )
-                return   # one successful sync is enough
+                return
             except httpx.RequestError:
                 logger.warning(f"Sync-on-rejoin: {node_id} unreachable, trying next")
 
@@ -146,15 +183,16 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="Distributed Key-Value Store",
     description="Multi-node distributed KV store with consistent hashing and replication",
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
-# Prometheus metrics  (auto-instruments all endpoints → /metrics)
+# Prometheus metrics
 # ---------------------------------------------------------------------------
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
@@ -166,29 +204,40 @@ try:
 except ImportError:
     logger.warning("prometheus-fastapi-instrumentator not installed — /metrics disabled")
 
+try:
+    from prometheus_client import Counter, Gauge
+    _tombstones_compacted = Counter(
+        "tombstones_compacted_total",
+        "Tombstones physically removed by the compaction loop",
+    )
+except ImportError:
+    class _Stub:
+        def inc(self, n=1): pass
+        def set(self, v): pass
+    _tombstones_compacted = _Stub()
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
+
 class KeyValue(BaseModel):
-    """Request body for PUT operations."""
     key: str
     value: str
     version: Optional[int] = None
 
 
-class ValueResponse(BaseModel):
-    """Response body for GET operations."""
-    value: str
+class TombstoneRequest(BaseModel):
+    version: int
+    tombstone_expires_at: float
 
 
 # ---------------------------------------------------------------------------
-# Public endpoints  (may forward to peer)
+# Public endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health_check():
-    """Health check — reports node identity and local key count."""
     return {
         "status": "healthy",
         "node_id": config.node_id,
@@ -198,57 +247,50 @@ async def health_check():
 
 @app.get("/kv/{key}")
 async def get_value(key: str):
-    """Retrieve a value with version.  Forwards to the owning node if needed."""
     try:
         value, version = await router.get(key)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
     if value is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Key '{key}' not found",
-        )
-    logger.info(f"GET '{key}' owner={router.owner_of(key)} ver={version}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Key '{key}' not found")
+    logger.info(f"GET '{key}' ver={version}")
     return {"value": value, "version": version}
 
 
 @app.put("/kv/{key}")
 async def put_value(key: str, request: KeyValue):
-    """Store a value.  Returns the new version number."""
     try:
         version = await router.put(key, request.value)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    logger.info(f"PUT '{key}' owner={router.owner_of(key)} ver={version}")
+    logger.info(f"PUT '{key}' ver={version}")
     return {"message": "success", "key": key, "version": version}
 
 
 @app.delete("/kv/{key}")
 async def delete_value(key: str):
-    """Delete a value.  Forwards to the owning node if needed."""
     try:
         deleted = await router.delete(key)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
     if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Key '{key}' not found",
-        )
-    logger.info(f"DELETE '{key}' owner={router.owner_of(key)}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Key '{key}' not found")
+    logger.info(f"DELETE '{key}' (tombstone written)")
     return {"message": "deleted", "key": key}
 
 
 # ---------------------------------------------------------------------------
-# Internal endpoints  (peer-to-peer only — NO further forwarding)
+# Internal endpoints (peer-to-peer — no further forwarding)
 # ---------------------------------------------------------------------------
 
 @app.get("/internal/kv/{key}")
 async def internal_get(key: str):
-    """Internal GET — reads directly from local storage, no forwarding."""
+    """Internal GET — reads directly from local storage."""
     value, version = await router.storage.get(key)
     if value is None:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
@@ -257,14 +299,8 @@ async def internal_get(key: str):
 
 @app.put("/internal/kv/{key}")
 async def internal_put(key: str, request: KeyValue):
-    """
-    Internal PUT — writes directly to local storage, no forwarding.
-
-    If the request includes a 'version' field, we use put_versioned()
-    to accept the leader's version as-is (replica fan-out).
-    If no version, we auto-increment (leader path).
-    """
-    if hasattr(request, 'version') and request.version is not None:
+    """Internal PUT — writes directly to local storage (leader or replica path)."""
+    if request.version is not None:
         await router.storage.put_versioned(key, request.value, request.version)
         version = request.version
     else:
@@ -274,22 +310,46 @@ async def internal_put(key: str, request: KeyValue):
 
 @app.delete("/internal/kv/{key}")
 async def internal_delete(key: str):
-    """Internal DELETE — deletes directly from local storage, no forwarding."""
+    """
+    Internal DELETE — writes a tombstone to local storage (leader path).
+
+    Returns version and tombstone_expires_at so the calling router can
+    fan-out the exact same tombstone to replicas.
+    """
     deleted = await router.storage.delete(key)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
-    return {"message": "deleted", "key": key}
+
+    entry = router.storage.store.get(key, {})
+    return {
+        "message": "deleted",
+        "key": key,
+        "version": entry.get("version"),
+        "tombstone_expires_at": entry.get("tombstone_expires_at"),
+    }
+
+
+@app.post("/internal/tombstone/{key}")
+async def internal_tombstone(key: str, request: TombstoneRequest):
+    """
+    Apply a tombstone received from the write-leader (replica fan-out path).
+
+    The version and tombstone_expires_at come from the leader so all replicas
+    store identical tombstones.
+    """
+    await router.storage.put_tombstone(
+        key, request.version, request.tombstone_expires_at
+    )
+    return {"message": "tombstone applied", "key": key, "version": request.version}
 
 
 @app.get("/internal/sync")
 async def internal_sync():
     """
-    Anti-entropy sync endpoint.
+    Anti-entropy endpoint — returns full local snapshot including tombstones.
 
-    Returns a full snapshot of this node's local key-value store.
-    Called by a rejoining peer during startup to catch up on missed writes.
-    The caller will merge this snapshot with its WAL-replayed state,
-    taking ours only for keys it doesn't already have.
+    Tombstones are included so rejoining peers can learn about deletions and
+    cannot resurrect keys that were removed while they were offline.
     """
     snapshot = await router.storage.snapshot()
     return {"node_id": config.node_id, "keys": snapshot}
@@ -301,15 +361,7 @@ async def internal_sync():
 
 @app.get("/cluster/health")
 async def cluster_health():
-    """
-    Aggregated cluster health view.
-
-    Uses the local HealthChecker's cached state (no live HTTP calls
-    on this endpoint) so it responds instantly even when peers are down.
-    Each peer's entry also shows their own view via /health when available.
-    """
-    health_map = health.get_status()   # dict[node_id, bool]
-
+    health_map = health.get_status()
     results: dict = {}
     for node_id, is_up in health_map.items():
         if config.is_local(node_id):
@@ -320,22 +372,15 @@ async def cluster_health():
                 "replication_factor": config.replication_factor,
             }
         else:
-            results[node_id] = {
-                "status": "healthy" if is_up else "unreachable",
-            }
-
-    return {
-        "cluster": results,
-        "replication_factor": config.replication_factor,
-    }
+            results[node_id] = {"status": "healthy" if is_up else "unreachable"}
+    return {"cluster": results, "replication_factor": config.replication_factor}
 
 
 @app.get("/stats")
 async def get_stats():
-    """Local node stats plus cluster health snapshot."""
     return {
         "node_id": config.node_id,
-        "version": "0.5.0",
+        "version": "0.9.0",
         "local_keys": await router.local_size(),
         "replication_factor": config.replication_factor,
         "peers": config.node_ids,
@@ -345,15 +390,13 @@ async def get_stats():
 
 @app.get("/")
 async def root():
-    """Root — service info."""
     return {
         "service": "Distributed KV Store",
-        "version": "0.5.0",
+        "version": "0.9.0",
         "node_id": config.node_id if config else "unknown",
         "endpoints": {
             "health": "/health",
             "cluster_health": "/cluster/health",
-            "stats": "/stats",
             "get": "GET /kv/{key}",
             "put": "PUT /kv/{key}",
             "delete": "DELETE /kv/{key}",

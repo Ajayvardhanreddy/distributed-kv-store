@@ -58,6 +58,12 @@ class NodeConfig:
         # WAL durability mode: "strict" (fsync per write) or "relaxed" (batched)
         self.durability: str = os.getenv("DURABILITY", "strict")
 
+        # How long tombstones are retained before physical compaction (seconds).
+        # 24h default — long enough for all replicas to learn about the delete.
+        self.tombstone_retention_seconds: float = float(
+            os.getenv("TOMBSTONE_RETENTION_SECONDS", "86400")
+        )
+
         logger.info(
             f"NodeConfig: id={self.node_id} port={self.port} "
             f"peers={list(self.peers.keys())} rf={self.replication_factor} "

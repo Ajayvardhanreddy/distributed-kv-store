@@ -215,18 +215,19 @@ async def test_delete_fans_out_to_replicas(monkeypatch):
         await storage.put(local_key, "v")
 
         router._forward_put = AsyncMock(return_value=None)
-        router._forward_delete_replica = AsyncMock(return_value=None)
+        # Phase 2: replica fan-out uses _forward_tombstone, not _forward_delete_replica
+        router._forward_tombstone = AsyncMock(return_value=None)
 
         result = await router.delete(local_key)
         assert result is True
         value, _ = await storage.get(local_key)
-        assert value is None   # removed locally
+        assert value is None   # tombstone → appears as miss
 
-        # Replica delete was forwarded for remaining nodes in replication set
+        # Tombstone was forwarded to remaining nodes in replication set
         replication_set = router.replicas_of(local_key)
         remote_replicas = [n for n in replication_set
                            if not router.config.is_local(n)]
-        assert router._forward_delete_replica.call_count == len(remote_replicas)
+        assert router._forward_tombstone.call_count == len(remote_replicas)
 
         await router.close(); await storage.close()
 
