@@ -14,6 +14,7 @@ This gives automatic leader failover without Raft.  The trade-off:
 """
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 import httpx
@@ -103,15 +104,20 @@ class ClusterRouter:
 
         raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
 
-    async def put(self, key: str, value: str) -> int:
+    async def put(
+        self, key: str, value: str, ttl_seconds: Optional[int] = None
+    ) -> int:
         """
         Write to the current write-leader + all other healthy replicas.
         Returns the new version number.
 
-        The write-leader decides the version (auto-increment on its
-        local StorageEngine.put()).  Replicas receive the same version
-        via put_versioned() so all copies are consistent.
+        ttl_seconds: if set, the leader computes expires_at = now + ttl_seconds
+                     and fans it out unchanged so all replicas expire identically.
         """
+        expires_at: Optional[float] = (
+            time.time() + ttl_seconds if ttl_seconds is not None else None
+        )
+
         owners = self.ring.get_nodes(key, n=self.replication_factor)
         leader = self._write_leader(owners)
         if leader is None:
@@ -119,19 +125,19 @@ class ClusterRouter:
 
         # Step 1: write to leader → get the authoritative version
         if self.config.is_local(leader):
-            version = await self.storage.put(key, value)
+            version = await self.storage.put(key, value, expires_at=expires_at)
         else:
-            version = await self._forward_put(leader, key, value)
+            version = await self._forward_put(leader, key, value, expires_at=expires_at)
 
-        # Step 2: fan-out to remaining healthy replicas with that version
+        # Step 2: fan-out to remaining healthy replicas with version + expires_at
         other_healthy = [
             n for n in owners
             if n != leader and (self.health is None or self.health.is_healthy(n))
         ]
         if other_healthy:
-            await self._replicate(other_healthy, key, value, version)
+            await self._replicate(other_healthy, key, value, version, expires_at=expires_at)
 
-        logger.info(f"PUT '{key}' ver={version} leader={leader}")
+        logger.info(f"PUT '{key}' ver={version} leader={leader} expires_at={expires_at}")
         return version
 
     async def delete(self, key: str) -> bool:
@@ -216,15 +222,20 @@ class ClusterRouter:
     # ------------------------------------------------------------------
 
     async def _replicate(
-        self, nodes: list[str], key: str, value: str, version: int
+        self, nodes: list[str], key: str, value: str, version: int,
+        expires_at: Optional[float] = None,
     ) -> None:
-        """Replicate a versioned PUT to all given nodes concurrently."""
+        """Replicate a versioned PUT (with optional TTL) to all given nodes concurrently."""
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
-                tasks.append(self.storage.put_versioned(key, value, version))
+                tasks.append(
+                    self.storage.put_versioned(key, value, version, expires_at=expires_at)
+                )
             else:
-                tasks.append(self._forward_put_versioned(node_id, key, value, version))
+                tasks.append(
+                    self._forward_put_versioned(node_id, key, value, version, expires_at=expires_at)
+                )
         await asyncio.gather(*tasks)
 
     async def _replicate_tombstone(
@@ -265,12 +276,18 @@ class ClusterRouter:
             logger.error(f"Forward GET failed for {key} → {node_id}: {e}")
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
-    async def _forward_put(self, node_id: str, key: str, value: str) -> int:
+    async def _forward_put(
+        self, node_id: str, key: str, value: str,
+        expires_at: Optional[float] = None,
+    ) -> int:
         """Forward PUT to leader node; returns the version assigned by the leader."""
         url = self._internal_url(node_id, key)
         logger.debug(f"Forwarding PUT {key} → {node_id}")
+        body: dict = {"key": key, "value": value}
+        if expires_at is not None:
+            body["expires_at"] = expires_at
         try:
-            resp = await self._client.put(url, json={"key": key, "value": value})
+            resp = await self._client.put(url, json=body)
             resp.raise_for_status()
             return resp.json().get("version", 1)
         except httpx.RequestError as e:
@@ -278,14 +295,16 @@ class ClusterRouter:
             raise RuntimeError(f"Peer {node_id} unreachable") from e
 
     async def _forward_put_versioned(
-        self, node_id: str, key: str, value: str, version: int
+        self, node_id: str, key: str, value: str, version: int,
+        expires_at: Optional[float] = None,
     ) -> None:
-        """Forward a versioned PUT to a replica node."""
+        """Forward a versioned PUT (with optional TTL) to a replica node."""
         url = self._internal_url(node_id, key)
+        body: dict = {"key": key, "value": value, "version": version}
+        if expires_at is not None:
+            body["expires_at"] = expires_at
         try:
-            resp = await self._client.put(
-                url, json={"key": key, "value": value, "version": version}
-            )
+            resp = await self._client.put(url, json=body)
             resp.raise_for_status()
         except httpx.RequestError as e:
             logger.error(f"Forward PUT_VERSIONED failed for {key} → {node_id}: {e}")

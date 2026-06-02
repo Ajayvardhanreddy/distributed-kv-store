@@ -142,10 +142,10 @@ async def test_snapshot_includes_versions():
         await engine.put("x", "2")
         await engine.put("y", "a")
         snap = await engine.snapshot()
-        # Phase 2: snapshot includes "deleted" field for all entries
+        # Phase 3: snapshot includes "deleted" and "expires_at" for all entries
         assert snap == {
-            "x": {"value": "2", "version": 2, "deleted": False},
-            "y": {"value": "a", "version": 1, "deleted": False},
+            "x": {"value": "2", "version": 2, "deleted": False, "expires_at": None},
+            "y": {"value": "a", "version": 1, "deleted": False, "expires_at": None},
         }
         await engine.close()
 

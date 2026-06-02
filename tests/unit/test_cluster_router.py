@@ -178,8 +178,9 @@ async def test_forward_put_called_for_remote_key(monkeypatch):
 
         router._forward_put = AsyncMock(return_value=1)
         await router.put(remote_key, "some-value")
+        # Phase 3: _forward_put now receives expires_at kwarg (None when no TTL)
         router._forward_put.assert_awaited_once_with(
-            router.owner_of(remote_key), remote_key, "some-value"
+            router.owner_of(remote_key), remote_key, "some-value", expires_at=None
         )
 
         await router.close()
