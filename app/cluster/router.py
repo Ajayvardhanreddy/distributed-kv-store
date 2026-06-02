@@ -22,6 +22,7 @@ import httpx
 from app.cluster.consistent_hash import ConsistentHashRing
 from app.cluster.node_config import NodeConfig
 from app.storage.engine import StorageEngine
+from app.storage.version_token import CASConflictError, version_matches
 
 if TYPE_CHECKING:
     from app.cluster.health_checker import HealthChecker
@@ -30,6 +31,23 @@ logger = logging.getLogger(__name__)
 
 # Timeout for peer-to-peer HTTP calls (seconds)
 FORWARD_TIMEOUT = 2.0
+
+# ---------------------------------------------------------------------------
+# Prometheus counter
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter
+    _cas_conflicts_total = Counter(
+        "cas_conflicts_total",
+        "Conditional write (CAS) failures due to version mismatch",
+    )
+except ImportError:
+    class _Stub:
+        class _val:
+            def get(self): return 0.0
+        _value = _val()
+        def inc(self, n=1): ...
+    _cas_conflicts_total = _Stub()
 
 
 class ClusterRouter:
@@ -105,14 +123,21 @@ class ClusterRouter:
         raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
 
     async def put(
-        self, key: str, value: str, ttl_seconds: Optional[int] = None
+        self,
+        key: str,
+        value: str,
+        ttl_seconds: Optional[int] = None,
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
     ) -> int:
         """
-        Write to the current write-leader + all other healthy replicas.
-        Returns the new version number.
+        Write to the write-leader + all healthy replicas.  Returns new version.
 
-        ttl_seconds: if set, the leader computes expires_at = now + ttl_seconds
-                     and fans it out unchanged so all replicas expire identically.
+        ttl_seconds   : sets expires_at on the leader; fanned out unchanged.
+        if_match      : token from a prior GET; fails with CASConflictError if stale.
+        if_none_match : fails with CASConflictError if key exists or is tombstoned.
+
+        Replicas receive put_versioned() — no CAS re-check on the replica path.
         """
         expires_at: Optional[float] = (
             time.time() + ttl_seconds if ttl_seconds is not None else None
@@ -123,13 +148,28 @@ class ClusterRouter:
         if leader is None:
             raise RuntimeError(f"No healthy node available for key '{key}'")
 
-        # Step 1: write to leader → get the authoritative version
+        # CAS check on local leader
         if self.config.is_local(leader):
+            if if_none_match or if_match is not None:
+                _, current_ver = await self.storage.get(key)
+                # For if_none_match we also check tombstones
+                raw_entry = self.storage.store.get(key)
+                key_present = raw_entry is not None
+                if if_none_match and key_present:
+                    _cas_conflicts_total.inc()
+                    raise CASConflictError(current_ver)
+                if if_match is not None and not version_matches(current_ver, if_match):
+                    _cas_conflicts_total.inc()
+                    raise CASConflictError(current_ver)
             version = await self.storage.put(key, value, expires_at=expires_at)
         else:
-            version = await self._forward_put(leader, key, value, expires_at=expires_at)
+            version = await self._forward_put(
+                leader, key, value,
+                expires_at=expires_at,
+                if_match=if_match,
+                if_none_match=if_none_match,
+            )
 
-        # Step 2: fan-out to remaining healthy replicas with version + expires_at
         other_healthy = [
             n for n in owners
             if n != leader and (self.health is None or self.health.is_healthy(n))
@@ -137,10 +177,10 @@ class ClusterRouter:
         if other_healthy:
             await self._replicate(other_healthy, key, value, version, expires_at=expires_at)
 
-        logger.info(f"PUT '{key}' ver={version} leader={leader} expires_at={expires_at}")
+        logger.info(f"PUT '{key}' ver={version} leader={leader}")
         return version
 
-    async def delete(self, key: str) -> bool:
+    async def delete(self, key: str, if_match: Optional[str] = None) -> bool:
         """
         Write a tombstone on the write-leader then fan-out to healthy replicas.
 
@@ -152,6 +192,13 @@ class ClusterRouter:
         leader = self._write_leader(owners)
         if leader is None:
             raise RuntimeError(f"No healthy node available for key '{key}'")
+
+        # CAS check on local leader before writing tombstone
+        if self.config.is_local(leader) and if_match is not None:
+            _, current_ver = await self.storage.get(key)
+            if not version_matches(current_ver, if_match):
+                _cas_conflicts_total.inc()
+                raise CASConflictError(current_ver)
 
         # Step 1: write tombstone on the leader → get the authoritative version
         if self.config.is_local(leader):
@@ -279,6 +326,8 @@ class ClusterRouter:
     async def _forward_put(
         self, node_id: str, key: str, value: str,
         expires_at: Optional[float] = None,
+        if_match: Optional[str] = None,
+        if_none_match: bool = False,
     ) -> int:
         """Forward PUT to leader node; returns the version assigned by the leader."""
         url = self._internal_url(node_id, key)
@@ -286,8 +335,17 @@ class ClusterRouter:
         body: dict = {"key": key, "value": value}
         if expires_at is not None:
             body["expires_at"] = expires_at
+        if if_match is not None:
+            body["if_match"] = if_match
+        if if_none_match:
+            body["if_none_match"] = True
         try:
             resp = await self._client.put(url, json=body)
+            if resp.status_code == 409:
+                data = resp.json()
+                current_token = data.get("detail", {}).get("current_token", "0")
+                from app.storage.version_token import decode_token
+                raise CASConflictError(decode_token(current_token))
             resp.raise_for_status()
             return resp.json().get("version", 1)
         except httpx.RequestError as e:

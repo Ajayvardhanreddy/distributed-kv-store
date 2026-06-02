@@ -27,6 +27,7 @@ from app.cluster.health_checker import HealthChecker
 from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
+from app.storage.version_token import CASConflictError, encode_token, version_matches
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -263,8 +264,10 @@ class KeyValue(BaseModel):
     key: str
     value: str
     version: Optional[int] = None
-    ttl_seconds: Optional[int] = None    # public PUT — converted to expires_at by router
-    expires_at: Optional[float] = None   # internal fan-out — absolute epoch seconds
+    ttl_seconds: Optional[int] = None     # public PUT — converted to expires_at by router
+    expires_at: Optional[float] = None    # internal fan-out — absolute epoch seconds
+    if_match: Optional[str] = None        # CAS: token from prior GET
+    if_none_match: Optional[bool] = False # CAS: create-if-absent
 
 
 class TombstoneRequest(BaseModel):
@@ -296,24 +299,40 @@ async def get_value(key: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail=f"Key '{key}' not found")
     logger.info(f"GET '{key}' ver={version}")
-    return {"value": value, "version": version}
+    # Phase 4: return opaque version_token only (raw int deprecated)
+    return {"value": value, "version_token": encode_token(version)}
 
 
 @app.put("/kv/{key}")
 async def put_value(key: str, request: KeyValue):
     try:
-        version = await router.put(key, request.value, ttl_seconds=request.ttl_seconds)
+        version = await router.put(
+            key, request.value,
+            ttl_seconds=request.ttl_seconds,
+            if_match=request.if_match,
+            if_none_match=bool(request.if_none_match),
+        )
+    except CASConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "version mismatch", "current_token": e.current_token},
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
     logger.info(f"PUT '{key}' ver={version}")
-    return {"message": "success", "key": key, "version": version}
+    return {"message": "success", "key": key, "version_token": encode_token(version)}
 
 
 @app.delete("/kv/{key}")
-async def delete_value(key: str):
+async def delete_value(key: str, if_match: Optional[str] = None):
     try:
-        deleted = await router.delete(key)
+        deleted = await router.delete(key, if_match=if_match)
+    except CASConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "version mismatch", "current_token": e.current_token},
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -340,21 +359,38 @@ async def internal_get(key: str):
 @app.put("/internal/kv/{key}")
 async def internal_put(key: str, request: KeyValue):
     """
-    Internal PUT — writes directly to local storage.
+    Internal PUT — writes directly to local storage (leader or replica path).
 
-    If version is set → replica path (put_versioned with expires_at).
-    Otherwise        → leader path (put with expires_at).
-    expires_at is passed unchanged from the leader so replicas expire identically.
+    version set     → replica fan-out: put_versioned, no CAS check
+    version absent  → leader path: CAS check if if_match / if_none_match present
     """
     if request.version is not None:
+        # Replica path — apply the leader's version, no CAS
         await router.storage.put_versioned(
             key, request.value, request.version, expires_at=request.expires_at
         )
-        version = request.version
-    else:
-        version = await router.storage.put(
-            key, request.value, expires_at=request.expires_at
-        )
+        return {"message": "success", "key": key, "version": request.version}
+
+    # Leader path — apply CAS if requested
+    if request.if_match is not None or request.if_none_match:
+        _, current_ver = await router.storage.get(key)
+        raw_entry = router.storage.store.get(key)
+        key_present = raw_entry is not None
+        if request.if_none_match and key_present:
+            from app.storage.version_token import encode_token as _enc
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "version mismatch", "current_token": _enc(current_ver)},
+            )
+        if request.if_match is not None and not version_matches(current_ver, request.if_match):
+            raise HTTPException(
+                status_code=409,
+                detail={"message": "version mismatch", "current_token": encode_token(current_ver)},
+            )
+
+    version = await router.storage.put(
+        key, request.value, expires_at=request.expires_at
+    )
     return {"message": "success", "key": key, "version": version}
 
 
