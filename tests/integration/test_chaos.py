@@ -330,7 +330,7 @@ async def test_concurrent_writes_produce_valid_versions():
                         json={"key": "concurrent:key", "value": f"v{i}"},
                     )
                     assert r.status_code == 200
-                    versions.append(r.json()["version"])
+                    versions.append(int(r.json()["version_token"]))
 
                 # Versions must be strictly increasing
                 for i in range(1, len(versions)):
@@ -340,7 +340,7 @@ async def test_concurrent_writes_produce_valid_versions():
 
                 # Final read should have the last version
                 r = await client.get(f"{handles['node-0'].base_url}/kv/concurrent:key")
-                assert r.json()["version"] == versions[-1]
+                assert int(r.json()["version_token"]) == versions[-1]
         finally:
             await stop_cluster(handles)
 
@@ -380,8 +380,8 @@ async def test_wal_replay_preserves_versions():
                 # Check version is preserved on the restarted node
                 r = await client.get(f"{handles['node-0'].base_url}/kv/replay:ver")
                 if r.status_code == 200:
-                    assert r.json()["version"] >= 3, (
-                        f"Expected version >= 3 after WAL replay, got {r.json()['version']}"
+                    assert int(r.json()["version_token"]) >= 3, (
+                        f"Expected version >= 3 after WAL replay, got {r.json()['version_token']}"
                     )
         finally:
             await stop_cluster(handles)
@@ -407,7 +407,7 @@ async def test_split_brain_version_detection():
                     json={"key": "split:key", "value": "initial"},
                 )
                 assert r.status_code == 200
-                initial_version = r.json()["version"]
+                initial_version = int(r.json()["version_token"])
 
                 # Read from both nodes to confirm replication
                 r0 = await client.get(f"{handles['node-0'].base_url}/kv/split:key")
@@ -415,8 +415,8 @@ async def test_split_brain_version_detection():
 
                 # The key should have a version > 0
                 assert initial_version >= 1
-                # Verify version is present in GET response
-                assert "version" in r0.json()
+                # Verify version_token is present in GET response (raw int deprecated Phase 4)
+                assert "version_token" in r0.json()
         finally:
             await stop_cluster(handles)
 

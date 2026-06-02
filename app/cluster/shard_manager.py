@@ -8,7 +8,7 @@ From the API's perspective, ShardManager looks like a single StorageEngine,
 but internally it manages N shards with separate WAL files.
 """
 import os
-from typing import Optional
+from typing import Optional, Tuple
 import logging
 from app.storage.engine import StorageEngine
 from app.cluster.consistent_hash import ConsistentHashRing
@@ -101,33 +101,24 @@ class ShardManager:
         
         return self.shards[shard_id]
     
-    async def get(self, key: str) -> Optional[str]:
+    async def get(self, key: str) -> tuple[Optional[str], int]:
         """
-        Get value for a key.
-        
-        Routes to the appropriate shard using consistent hashing.
-        
-        Args:
-            key: Key to look up
-            
-        Returns:
-            Value if found, None otherwise
+        Get value and version for a key.
+
+        Returns (value, version), or (None, 0) if the key does not exist.
+        Interface matches StorageEngine.get().
         """
         shard = self._get_shard(key)
         return await shard.get(key)
-    
-    async def put(self, key: str, value: str) -> None:
+
+    async def put(self, key: str, value: str) -> int:
         """
-        Store a key-value pair.
-        
-        Routes to the appropriate shard using consistent hashing.
-        
-        Args:
-            key: Key to store
-            value: Value to store
+        Store a key-value pair. Returns the new version number.
+
+        Interface matches StorageEngine.put().
         """
         shard = self._get_shard(key)
-        await shard.put(key, value)
+        return await shard.put(key, value)
     
     async def delete(self, key: str) -> bool:
         """
