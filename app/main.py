@@ -44,12 +44,14 @@ config: NodeConfig = None
 router: ClusterRouter = None
 health: HealthChecker = None
 
-# Compaction interval — how often expired tombstones are physically removed
-_COMPACT_INTERVAL_SECONDS = 300.0  # 5 minutes
+# Background task intervals
+_COMPACT_INTERVAL_SECONDS = 300.0   # 5 minutes
+_SWEEPER_INTERVAL_SECONDS = 60.0    # 1 minute
+_SWEEPER_SAMPLE_SIZE = 100          # keys sampled per run
 
 
 # ---------------------------------------------------------------------------
-# Background compaction loop
+# Background loops
 # ---------------------------------------------------------------------------
 
 async def _compact_loop(storage: StorageEngine, interval: float) -> None:
@@ -60,6 +62,33 @@ async def _compact_loop(storage: StorageEngine, interval: float) -> None:
             removed = await storage.compact()
             if removed:
                 logger.info(f"Compaction: removed {removed} expired tombstones")
+    except asyncio.CancelledError:
+        pass
+
+
+async def _sweeper_loop(
+    kv_router: "ClusterRouter",
+    interval: float,
+    sample_size: int,
+) -> None:
+    """
+    Active TTL sweeper — samples keys, tombstones expired ones via router.delete()
+    so the tombstone fans out to all replicas (Phase 2 contract).
+    """
+    from app.storage.engine import _keys_expired_total, _sweeper_runs_total
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            _sweeper_runs_total.inc()
+            expired = await kv_router.storage.get_expired_keys(sample_size)
+            for key in expired:
+                try:
+                    deleted = await kv_router.delete(key)
+                    if deleted:
+                        _keys_expired_total.inc()
+                        logger.debug(f"Sweeper: tombstoned expired key '{key}'")
+                except RuntimeError as exc:
+                    logger.warning(f"Sweeper: could not tombstone '{key}': {exc}")
     except asyncio.CancelledError:
         pass
 
@@ -101,18 +130,23 @@ async def lifespan(app: FastAPI):
 
     await sync_from_peers(config, storage)
 
-    # Start background compaction
+    # Start background tasks
     compact_task = asyncio.create_task(
         _compact_loop(storage, _COMPACT_INTERVAL_SECONDS)
+    )
+    sweeper_task = asyncio.create_task(
+        _sweeper_loop(router, _SWEEPER_INTERVAL_SECONDS, _SWEEPER_SAMPLE_SIZE)
     )
 
     yield
 
+    sweeper_task.cancel()
     compact_task.cancel()
-    try:
-        await compact_task
-    except asyncio.CancelledError:
-        pass
+    for task in (sweeper_task, compact_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     await health.stop()
     await router.close()
@@ -166,7 +200,11 @@ async def sync_from_peers(cfg: NodeConfig, storage: StorageEngine) -> None:
                         expires = entry.get("tombstone_expires_at", time.time() + 86400)
                         await storage.put_tombstone(key, peer_version, expires)
                     else:
-                        await storage.put_versioned(key, entry["value"], peer_version)
+                        # Carry expires_at so this node expires at the same time as the peer
+                        await storage.put_versioned(
+                            key, entry["value"], peer_version,
+                            expires_at=entry.get("expires_at"),
+                        )
                     synced += 1
 
                 logger.info(
@@ -225,6 +263,8 @@ class KeyValue(BaseModel):
     key: str
     value: str
     version: Optional[int] = None
+    ttl_seconds: Optional[int] = None    # public PUT — converted to expires_at by router
+    expires_at: Optional[float] = None   # internal fan-out — absolute epoch seconds
 
 
 class TombstoneRequest(BaseModel):
@@ -262,7 +302,7 @@ async def get_value(key: str):
 @app.put("/kv/{key}")
 async def put_value(key: str, request: KeyValue):
     try:
-        version = await router.put(key, request.value)
+        version = await router.put(key, request.value, ttl_seconds=request.ttl_seconds)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -299,12 +339,22 @@ async def internal_get(key: str):
 
 @app.put("/internal/kv/{key}")
 async def internal_put(key: str, request: KeyValue):
-    """Internal PUT — writes directly to local storage (leader or replica path)."""
+    """
+    Internal PUT — writes directly to local storage.
+
+    If version is set → replica path (put_versioned with expires_at).
+    Otherwise        → leader path (put with expires_at).
+    expires_at is passed unchanged from the leader so replicas expire identically.
+    """
     if request.version is not None:
-        await router.storage.put_versioned(key, request.value, request.version)
+        await router.storage.put_versioned(
+            key, request.value, request.version, expires_at=request.expires_at
+        )
         version = request.version
     else:
-        version = await router.storage.put(key, request.value)
+        version = await router.storage.put(
+            key, request.value, expires_at=request.expires_at
+        )
     return {"message": "success", "key": key, "version": version}
 
 

@@ -1,25 +1,29 @@
 """
-Storage Engine — Phase 2: Tombstone DELETE model.
+Storage Engine — Phase 3: TTL lazy + active expiration.
 
 Store entry shapes
 ------------------
-Live key   : {"value": str,  "version": int, "deleted": False}
-Tombstone  : {"deleted": True, "version": int, "tombstone_expires_at": float}
+Live key (no TTL) : {"value": str, "version": int, "deleted": False, "expires_at": None}
+Live key (TTL)    : {"value": str, "version": int, "deleted": False, "expires_at": float}
+Tombstone         : {"deleted": True, "version": int, "tombstone_expires_at": float}
 
-DELETE contract
----------------
-Every delete() writes a tombstone to WAL and memory.
-Physical removal only happens via compact() after tombstone_expires_at.
-GET / exists / size treat tombstones as misses — callers cannot distinguish
-a tombstoned key from a key that never existed.
+Expiration contract
+-------------------
+  Lazy : GET / exists / size treat entries with expires_at <= now as misses.
+         The read path is side-effect-free — no tombstone is written on read.
+  Active: get_expired_keys() samples the store and returns keys ready to be
+         tombstoned.  The caller (sweeper loop in main.py) calls delete() on
+         each, which writes a Phase-2 tombstone and fans out to replicas.
 
-snapshot() includes tombstones so replicas and sync-on-rejoin can propagate
-deletions and prevent resurrection.
+expires_at is an absolute epoch-seconds float. It is set by the write leader
+and travels unchanged through the replication fan-out so all replicas expire
+at the same wall-clock moment.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Optional
 
@@ -27,14 +31,31 @@ from .wal import WriteAheadLog
 
 logger = logging.getLogger(__name__)
 
-# Default tombstone retention when not overridden (24 h)
 _DEFAULT_RETENTION_SECONDS = 86_400.0
+
+# ---------------------------------------------------------------------------
+# Prometheus counters
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter
+    _keys_expired_total = Counter(
+        "keys_expired_total",
+        "Keys expired and tombstoned by the active sweeper",
+    )
+    _sweeper_runs_total = Counter(
+        "sweeper_runs_total",
+        "Number of active sweeper iterations",
+    )
+except ImportError:  # pragma: no cover
+    class _Stub:
+        def inc(self, n=1): ...
+    _keys_expired_total = _Stub()
+    _sweeper_runs_total = _Stub()
 
 
 class StorageEngine:
     """
-    Thread-safe in-memory key-value store with WAL-backed durability,
-    per-key monotonic versioning, and tombstone-based deletes.
+    Thread-safe in-memory KV store with WAL durability, tombstone DELETEs, and TTL.
     """
 
     def __init__(
@@ -51,7 +72,7 @@ class StorageEngine:
         logger.info(f"StorageEngine init: wal={wal_path} durability={durability}")
 
     async def initialize(self) -> None:
-        """Replay WAL to restore state (live keys + tombstones)."""
+        """Replay WAL to restore state (live keys + tombstones + TTLs)."""
         logger.info("Replaying WAL…")
         self.store = await self.wal.replay()
         live = sum(1 for e in self.store.values() if not e.get("deleted"))
@@ -63,36 +84,57 @@ class StorageEngine:
     # ------------------------------------------------------------------
 
     async def get(self, key: str) -> tuple[Optional[str], int]:
-        """Return (value, version). Tombstones and missing keys both → (None, 0)."""
+        """
+        Return (value, version).
+
+        Returns (None, 0) for:
+          - missing keys
+          - tombstoned keys
+          - keys whose expires_at has passed (lazy expiry — no side effects)
+        """
         async with self.lock:
             entry = self.store.get(key)
             if entry is None or entry.get("deleted"):
                 return None, 0
+            expires_at = entry.get("expires_at")
+            if expires_at is not None and expires_at <= time.time():
+                return None, 0   # expired — caller cannot distinguish from absent
             return entry["value"], entry["version"]
 
     async def get_version(self, key: str) -> int:
-        """Return the current version for a key, including tombstones. 0 if absent."""
+        """Version for key including tombstones. 0 if absent."""
         async with self.lock:
             entry = self.store.get(key)
             return entry["version"] if entry else 0
 
     async def exists(self, key: str) -> bool:
-        """True only for live (non-tombstoned) keys."""
+        """True only for live, non-expired keys."""
         async with self.lock:
             entry = self.store.get(key)
-            return entry is not None and not entry.get("deleted")
+            if entry is None or entry.get("deleted"):
+                return False
+            expires_at = entry.get("expires_at")
+            if expires_at is not None and expires_at <= time.time():
+                return False
+            return True
 
     async def size(self) -> int:
-        """Count of live keys only (tombstones excluded)."""
+        """Count of live, non-expired keys only."""
         async with self.lock:
-            return sum(1 for e in self.store.values() if not e.get("deleted"))
+            now = time.time()
+            return sum(
+                1 for e in self.store.values()
+                if not e.get("deleted") and (
+                    e.get("expires_at") is None or e["expires_at"] > now
+                )
+            )
 
     async def snapshot(self) -> dict[str, dict]:
         """
-        Full copy of the store including tombstones.
+        Full copy of the store including tombstones and expires_at.
 
-        Used by /internal/sync so rejoining peers receive deletes and cannot
-        resurrect keys that were removed while they were offline.
+        Used by /internal/sync — expires_at travels to peers so replicas
+        expire at the same wall-clock moment as the leader.
         """
         async with self.lock:
             return {k: dict(v) for k, v in self.store.items()}
@@ -101,23 +143,44 @@ class StorageEngine:
     # Writes — live entries
     # ------------------------------------------------------------------
 
-    async def put(self, key: str, value: str) -> int:
-        """Store a key-value pair, auto-incrementing the version. Returns new version."""
+    async def put(self, key: str, value: str, expires_at: Optional[float] = None) -> int:
+        """
+        Store a key-value pair. Returns new version.
+
+        expires_at: absolute epoch-seconds float set by the write leader.
+                    None means the key never expires.
+        """
         async with self.lock:
             current = self.store.get(key)
-            # Version increments from whatever was there (live or tombstone)
             new_version = (current["version"] + 1) if current else 1
-            await self.wal.append("PUT", key, value, version=new_version)
-            self.store[key] = {"value": value, "version": new_version, "deleted": False}
-        logger.debug(f"PUT {key} ver={new_version}")
+            await self.wal.append(
+                "PUT", key, value, version=new_version, expires_at=expires_at
+            )
+            self.store[key] = {
+                "value": value,
+                "version": new_version,
+                "deleted": False,
+                "expires_at": expires_at,
+            }
+        logger.debug(f"PUT {key} ver={new_version} expires_at={expires_at}")
         return new_version
 
-    async def put_versioned(self, key: str, value: str, version: int) -> None:
-        """Store with an explicit version (replica fan-out / sync-on-rejoin)."""
+    async def put_versioned(
+        self, key: str, value: str, version: int,
+        expires_at: Optional[float] = None,
+    ) -> None:
+        """Store with explicit version and optional expiry (replica / sync path)."""
         async with self.lock:
-            await self.wal.append("PUT", key, value, version=version)
-            self.store[key] = {"value": value, "version": version, "deleted": False}
-        logger.debug(f"PUT_VERSIONED {key} ver={version}")
+            await self.wal.append(
+                "PUT", key, value, version=version, expires_at=expires_at
+            )
+            self.store[key] = {
+                "value": value,
+                "version": version,
+                "deleted": False,
+                "expires_at": expires_at,
+            }
+        logger.debug(f"PUT_VERSIONED {key} ver={version} expires_at={expires_at}")
 
     # ------------------------------------------------------------------
     # Writes — tombstones
@@ -127,14 +190,13 @@ class StorageEngine:
         """
         Write a tombstone for key. Returns True if the key was live, False otherwise.
 
-        The tombstone carries version = current_version + 1 so it always beats
-        the previous live entry during sync-on-rejoin comparisons.
-        Physical removal happens only via compact().
+        Works on expired-but-not-yet-tombstoned keys too — this is exactly what
+        the active sweeper calls to finalise expiry.
         """
         async with self.lock:
             entry = self.store.get(key)
             if entry is None or entry.get("deleted"):
-                return False   # key absent or already a tombstone
+                return False
 
             new_version = entry["version"] + 1
             expires_at = time.time() + self._tombstone_retention
@@ -155,12 +217,7 @@ class StorageEngine:
     async def put_tombstone(
         self, key: str, version: int, tombstone_expires_at: float
     ) -> None:
-        """
-        Apply a tombstone received from a peer (sync-on-rejoin / replica fan-out).
-
-        Writes to WAL so the tombstone survives a subsequent crash.
-        The caller is responsible for the version-comparison guard.
-        """
+        """Apply a peer tombstone (sync-on-rejoin / replica fan-out)."""
         async with self.lock:
             await self.wal.append(
                 "DELETE", key, version=version,
@@ -174,16 +231,35 @@ class StorageEngine:
         logger.debug(f"PUT_TOMBSTONE {key} ver={version}")
 
     # ------------------------------------------------------------------
-    # Compaction — the ONLY place physical deletion is allowed
+    # Active sweeper support
+    # ------------------------------------------------------------------
+
+    async def get_expired_keys(self, sample_size: int = 100) -> list[str]:
+        """
+        Sample up to sample_size live keys and return those whose expires_at
+        has passed. Never does a full scan — O(sample_size).
+
+        The caller (sweeper loop) is responsible for calling delete() on each
+        returned key and fanning out the tombstone to replicas.
+        """
+        now = time.time()
+        async with self.lock:
+            # Only consider live (non-tombstoned) keys that have a TTL
+            candidates = [
+                k for k, v in self.store.items()
+                if not v.get("deleted") and v.get("expires_at") is not None
+            ]
+            if not candidates:
+                return []
+            sample = random.sample(candidates, min(sample_size, len(candidates)))
+            return [k for k in sample if self.store[k]["expires_at"] <= now]
+
+    # ------------------------------------------------------------------
+    # Compaction — only place physical deletion is allowed
     # ------------------------------------------------------------------
 
     async def compact(self) -> int:
-        """
-        Physically remove tombstones whose tombstone_expires_at has passed.
-
-        Returns the number of tombstones removed.
-        This is the single allowed site of `del self.store[key]`.
-        """
+        """Physically remove tombstones past tombstone_expires_at."""
         now = time.time()
         async with self.lock:
             expired = [
@@ -192,9 +268,8 @@ class StorageEngine:
             ]
             for key in expired:
                 del self.store[key]
-
         if expired:
-            logger.info(f"Compaction: physically removed {len(expired)} expired tombstones")
+            logger.info(f"Compaction: removed {len(expired)} expired tombstones")
         return len(expired)
 
     # ------------------------------------------------------------------

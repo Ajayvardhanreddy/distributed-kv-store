@@ -205,6 +205,7 @@ class WriteAheadLog:
         value: Optional[str] = None,
         version: int = 0,
         tombstone_expires_at: Optional[float] = None,
+        expires_at: Optional[float] = None,
     ) -> None:
         payload: dict = {
             "schema_version": 1,
@@ -217,6 +218,8 @@ class WriteAheadLog:
             payload["value"] = value
         if tombstone_expires_at is not None:
             payload["tombstone_expires_at"] = tombstone_expires_at
+        if expires_at is not None:
+            payload["expires_at"] = expires_at
 
         record = _encode_record(payload)
 
@@ -298,6 +301,7 @@ class WriteAheadLog:
                 "value": entry.get("value", ""),
                 "version": ver,
                 "deleted": False,
+                "expires_at": entry.get("expires_at"),   # None = no TTL
             }
         elif op == "DELETE":
             # Phase 2: DELETE produces a tombstone, never a physical removal.

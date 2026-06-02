@@ -208,10 +208,10 @@ async def test_snapshot_returns_full_store():
         await storage.put("a", "1")
         await storage.put("b", "2")
         snap = await storage.snapshot()
-        # Phase 2: snapshot includes "deleted" field for all entries
+        # Phase 3: snapshot includes "deleted" and "expires_at" for all entries
         assert snap == {
-            "a": {"value": "1", "version": 1, "deleted": False},
-            "b": {"value": "2", "version": 1, "deleted": False},
+            "a": {"value": "1", "version": 1, "deleted": False, "expires_at": None},
+            "b": {"value": "2", "version": 1, "deleted": False, "expires_at": None},
         }
         await storage.close()
 
