@@ -67,15 +67,21 @@ _FLUSH_BATCH_SIZE = 100
 # Prometheus counters (graceful fallback when library is absent)
 # ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter
-    _wal_corrupt_total = Counter(
-        "wal_corrupt_records_total",
-        "WAL records skipped due to CRC or framing errors",
-    )
-    _wal_replay_total = Counter(
-        "wal_replay_records_total",
-        "WAL records successfully applied during replay",
-    )
+    from prometheus_client import REGISTRY, Counter
+    try:
+        _wal_corrupt_total = Counter(
+            "wal_corrupt_records_total",
+            "WAL records skipped due to CRC or framing errors",
+        )
+    except ValueError:
+        _wal_corrupt_total = REGISTRY._names_to_collectors["wal_corrupt_records_total"]
+    try:
+        _wal_replay_total = Counter(
+            "wal_replay_records_total",
+            "WAL records successfully applied during replay",
+        )
+    except ValueError:
+        _wal_replay_total = REGISTRY._names_to_collectors["wal_replay_records_total"]
 except ImportError:  # pragma: no cover
     class _StubCounter:  # type: ignore[no-redef]
         class _val:

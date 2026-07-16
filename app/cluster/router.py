@@ -36,11 +36,14 @@ FORWARD_TIMEOUT = 2.0
 # Prometheus counter
 # ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter
-    _cas_conflicts_total = Counter(
-        "cas_conflicts_total",
-        "Conditional write (CAS) failures due to version mismatch",
-    )
+    from prometheus_client import REGISTRY, Counter
+    try:
+        _cas_conflicts_total = Counter(
+            "cas_conflicts_total",
+            "Conditional write (CAS) failures due to version mismatch",
+        )
+    except ValueError:
+        _cas_conflicts_total = REGISTRY._names_to_collectors["cas_conflicts_total"]
 except ImportError:
     class _Stub:
         class _val:
@@ -100,27 +103,36 @@ class ClusterRouter:
         Tries each node in the replication set in order (primary first).
         Skips nodes the HealthChecker has already marked down.
         On a network error, marks the node down immediately and tries the next.
+        On a miss (None, 0), continues to the next replica — handles the case
+        where a newly-rejoined replica hasn't synced yet.
         Raises RuntimeError only if every replica in the set is exhausted.
         """
         candidates = self.ring.get_nodes(key, n=self.replication_factor)
+        reached_any = False
 
         for node_id in candidates:
-            # Skip nodes we already know are down
             if self.health and not self.health.is_healthy(node_id):
                 logger.debug(f"GET '{key}': skipping {node_id} (marked down)")
                 continue
 
             try:
                 if self.config.is_local(node_id):
-                    return await self.storage.get(key)
-                return await self._forward_get(node_id, key)
+                    value, version = await self.storage.get(key)
+                else:
+                    value, version = await self._forward_get(node_id, key)
+                reached_any = True
+                if value is not None:
+                    return value, version
+                # Miss — replica may be stale (e.g. not yet synced); try next
+                logger.debug(f"GET '{key}': {node_id} miss, trying next replica")
             except RuntimeError:
-                # Network failure — mark down immediately, try next replica
                 if self.health:
                     self.health.mark_down(node_id)
                 logger.warning(f"GET '{key}': {node_id} failed, trying next replica")
 
-        raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
+        if not reached_any:
+            raise RuntimeError(f"All replicas unreachable for key '{key}'") from None
+        return None, 0
 
     async def put(
         self,
@@ -272,7 +284,7 @@ class ClusterRouter:
         self, nodes: list[str], key: str, value: str, version: int,
         expires_at: Optional[float] = None,
     ) -> None:
-        """Replicate a versioned PUT (with optional TTL) to all given nodes concurrently."""
+        """Replicate a versioned PUT to all given nodes. Failures are best-effort."""
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
@@ -283,12 +295,17 @@ class ClusterRouter:
                 tasks.append(
                     self._forward_put_versioned(node_id, key, value, version, expires_at=expires_at)
                 )
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for node_id, result in zip(nodes, results):
+            if isinstance(result, Exception):
+                if self.health:
+                    self.health.mark_down(node_id)
+                logger.warning(f"Replication PUT to {node_id} failed (key='{key}'): {result}")
 
     async def _replicate_tombstone(
         self, nodes: list[str], key: str, version: int, tombstone_expires_at: float
     ) -> None:
-        """Fan-out a tombstone (with leader-assigned version) to replica nodes."""
+        """Fan-out tombstone to replica nodes. Failures are best-effort."""
         tasks = []
         for node_id in nodes:
             if self.config.is_local(node_id):
@@ -299,7 +316,14 @@ class ClusterRouter:
                 tasks.append(
                     self._forward_tombstone(node_id, key, version, tombstone_expires_at)
                 )
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for node_id, result in zip(nodes, results):
+            if isinstance(result, Exception):
+                if self.health:
+                    self.health.mark_down(node_id)
+                logger.warning(
+                    f"Replication DELETE to {node_id} failed (key='{key}'): {result}"
+                )
 
     # ------------------------------------------------------------------
     # Internal HTTP forwarding helpers

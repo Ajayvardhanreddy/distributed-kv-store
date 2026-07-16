@@ -37,15 +37,21 @@ _DEFAULT_RETENTION_SECONDS = 86_400.0
 # Prometheus counters
 # ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter
-    _keys_expired_total = Counter(
-        "keys_expired_total",
-        "Keys expired and tombstoned by the active sweeper",
-    )
-    _sweeper_runs_total = Counter(
-        "sweeper_runs_total",
-        "Number of active sweeper iterations",
-    )
+    from prometheus_client import REGISTRY, Counter
+    try:
+        _keys_expired_total = Counter(
+            "keys_expired_total",
+            "Keys expired and tombstoned by the active sweeper",
+        )
+    except ValueError:
+        _keys_expired_total = REGISTRY._names_to_collectors["keys_expired_total"]
+    try:
+        _sweeper_runs_total = Counter(
+            "sweeper_runs_total",
+            "Number of active sweeper iterations",
+        )
+    except ValueError:
+        _sweeper_runs_total = REGISTRY._names_to_collectors["sweeper_runs_total"]
 except ImportError:  # pragma: no cover
     class _Stub:
         def inc(self, n=1): ...

@@ -64,6 +64,11 @@ class NodeConfig:
             os.getenv("TOMBSTONE_RETENTION_SECONDS", "86400")
         )
 
+        # Background health-check ping interval (seconds).
+        self.health_check_interval: float = float(
+            os.getenv("HEALTH_CHECK_INTERVAL", "5.0")
+        )
+
         logger.info(
             f"NodeConfig: id={self.node_id} port={self.port} "
             f"peers={list(self.peers.keys())} rf={self.replication_factor} "
