@@ -4,9 +4,11 @@ Unit tests for StorageEngine.
 Tests the core storage operations without WAL persistence
 (WAL is tested separately).
 """
-import pytest
-import tempfile
 import os
+import tempfile
+
+import pytest
+
 from app.storage.engine import StorageEngine
 
 

@@ -76,6 +76,7 @@ class NodeHandle:
 
         # Import fresh app instance under patched env
         import importlib
+
         import app.main as main_mod
         importlib.reload(main_mod)
         application = main_mod.app
@@ -154,7 +155,6 @@ async def test_read_survives_primary_crash():
                 assert r.status_code == 200, f"PUT failed: {r.text}"
 
                 # Discover the primary for this key
-                stats = (await client.get(f"{handles['node-0'].base_url}/stats")).json()
                 # Key is replicated to 2 nodes — find the non-node-0 copy
                 # Kill the primary node for chaos:read
                 # (We ask node-0 who owns the key)

@@ -4,16 +4,15 @@ Unit tests for Write-Ahead Log (WAL) — Phase 1: Binary format with CRC32.
 Tests cover both logical behaviour (replay returns correct state) and
 physical format (magic header, record framing, CRC integrity, migration).
 """
+import binascii
 import os
 import struct
 import tempfile
-import binascii
 
 import msgpack
 import pytest
 
-from app.storage.wal import WriteAheadLog, MAGIC, FORMAT_VERSION, RECORD_HEADER_SIZE
-
+from app.storage.wal import FORMAT_VERSION, MAGIC, WriteAheadLog
 
 # ---------------------------------------------------------------------------
 # Logical behaviour (unchanged from Phase 0 — must all still pass)
@@ -170,7 +169,7 @@ async def test_binary_wal_crc_corruption_stops_at_last_good_record():
             # now at second record header — overwrite its CRC
             rec2_start = f.tell()
             hdr2 = f.read(8)
-            length2 = struct.unpack(">II", hdr2)[0]
+            struct.unpack(">II", hdr2)  # advance past header; CRC is bytes 4-7
             f.seek(rec2_start + 4)  # CRC is bytes 4-7 of record header
             f.write(b'\xFF\xFF\xFF\xFF')  # garbage CRC
 
@@ -209,7 +208,8 @@ async def test_binary_wal_migration_from_json():
         wal_path = os.path.join(tmpdir, "legacy.wal")
 
         # Write a legacy JSON WAL by hand
-        import json, time
+        import json
+        import time
         with open(wal_path, "w") as f:
             f.write(json.dumps({"op": "PUT", "key": "migrated", "value": "yes",
                                  "ver": 1, "ts": int(time.time())}) + "\n")
@@ -237,7 +237,8 @@ async def test_binary_wal_migration_with_corrupt_json_line():
     """Migration skips corrupt JSON lines; valid lines still make it to state."""
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "corrupt_legacy.wal")
-        import json, time
+        import json
+        import time
         with open(wal_path, "w") as f:
             f.write(json.dumps({"op": "PUT", "key": "key1", "value": "value1",
                                  "ver": 1, "ts": int(time.time())}) + "\n")
@@ -258,7 +259,8 @@ async def test_binary_wal_migration_with_missing_field():
     """Migration skips JSON entries with missing required fields."""
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "missing_field.wal")
-        import json, time
+        import json
+        import time
         with open(wal_path, "w") as f:
             f.write(json.dumps({"op": "PUT", "value": "value1",
                                  "ver": 1, "ts": int(time.time())}) + "\n")  # missing key

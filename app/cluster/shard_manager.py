@@ -7,11 +7,12 @@ consistent hashing to route each key to the appropriate shard.
 From the API's perspective, ShardManager looks like a single StorageEngine,
 but internally it manages N shards with separate WAL files.
 """
-import os
-from typing import Optional, Tuple
 import logging
-from app.storage.engine import StorageEngine
+import os
+from typing import Optional
+
 from app.cluster.consistent_hash import ConsistentHashRing
+from app.storage.engine import StorageEngine
 
 logger = logging.getLogger(__name__)
 

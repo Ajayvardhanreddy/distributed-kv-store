@@ -3,9 +3,11 @@ Unit tests for ShardManager.
 
 Tests the shard management and routing logic.
 """
-import pytest
-import tempfile
 import os
+import tempfile
+
+import pytest
+
 from app.cluster.shard_manager import ShardManager
 
 

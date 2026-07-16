@@ -35,6 +35,7 @@ wal_replay_records_total   — records successfully applied during replay.
 """
 from __future__ import annotations
 
+import asyncio
 import binascii
 import json
 import logging
@@ -44,7 +45,6 @@ import time
 from typing import Optional
 
 import aiofiles
-import asyncio
 import msgpack
 
 logger = logging.getLogger(__name__)

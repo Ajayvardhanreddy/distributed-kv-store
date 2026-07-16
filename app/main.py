@@ -244,7 +244,7 @@ except ImportError:
     logger.warning("prometheus-fastapi-instrumentator not installed — /metrics disabled")
 
 try:
-    from prometheus_client import Counter, Gauge
+    from prometheus_client import Counter
     _tombstones_compacted = Counter(
         "tombstones_compacted_total",
         "Tombstones physically removed by the compaction loop",

@@ -7,14 +7,14 @@ peer processes are needed.
 """
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.cluster.consistent_hash import ConsistentHashRing
 from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
-
 
 # ---------------------------------------------------------------------------
 # Helpers

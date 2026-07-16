@@ -12,8 +12,8 @@ Environment variables:
     REPLICATION_FACTOR - How many nodes each key is written to (default 2)
     DATA_DIR           - Directory for WAL files (default "data")
 """
-import os
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 

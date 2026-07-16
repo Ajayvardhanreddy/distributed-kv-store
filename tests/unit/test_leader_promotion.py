@@ -22,7 +22,6 @@ from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -173,7 +172,8 @@ async def test_put_routes_to_promoted_leader(monkeypatch):
         assert primary not in called_nodes, "Primary was called despite being marked down"
         assert replica in called_nodes, "Replica was not promoted as write target"
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -192,7 +192,8 @@ async def test_put_raises_when_all_nodes_down(monkeypatch):
         with pytest.raises(RuntimeError, match="No healthy node"):
             await router.put(key, "value")
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 # ---------------------------------------------------------------------------

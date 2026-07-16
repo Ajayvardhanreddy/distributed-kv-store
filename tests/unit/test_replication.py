@@ -10,7 +10,7 @@ Tests cover:
 """
 import os
 import tempfile
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -18,7 +18,6 @@ from app.cluster.consistent_hash import ConsistentHashRing
 from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
-
 
 # -----------------------------------------------------------------------
 # Helpers
@@ -114,7 +113,8 @@ async def test_replication_factor_from_env(monkeypatch):
             replication_factor=1,
         )
         assert router.replication_factor == 1
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -128,7 +128,8 @@ async def test_replicas_of_returns_n_nodes(monkeypatch):
         rset = router.replicas_of("hello")
         assert len(rset) == 2
         assert len(set(rset)) == 2
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 # -----------------------------------------------------------------------
@@ -164,7 +165,8 @@ async def test_put_fans_out_to_all_replicas(monkeypatch):
         )
         assert total_remote_calls == len(remote_nodes)
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -184,7 +186,8 @@ async def test_put_with_rf1_no_replication(monkeypatch):
         value, version = await storage.get("key")
         assert value == "value"
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 # -----------------------------------------------------------------------
@@ -202,7 +205,6 @@ async def test_delete_fans_out_to_replicas(monkeypatch):
         )
 
         # Seed the key directly into local storage so the existence check passes
-        test_key = "delete-me"
         # First find a key that belongs to node-0 (our local node)
         local_key = None
         for i in range(200):
@@ -229,7 +231,8 @@ async def test_delete_fans_out_to_replicas(monkeypatch):
                            if not router.config.is_local(n)]
         assert router._forward_tombstone.call_count == len(remote_replicas)
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -240,7 +243,8 @@ async def test_delete_nonexistent_returns_false(monkeypatch):
             replication_factor=1,
         )
         assert await router.delete("no-such-key") is False
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 # -----------------------------------------------------------------------
@@ -274,4 +278,5 @@ async def test_replica_failure_raises_runtime_error(monkeypatch):
         with pytest.raises(RuntimeError, match="unreachable"):
             await router.put(remote_key, "value")
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()

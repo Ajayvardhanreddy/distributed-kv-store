@@ -13,7 +13,6 @@ CASConflictError is raised by the router when a version check fails.
 """
 from __future__ import annotations
 
-
 # ---------------------------------------------------------------------------
 # Token encoding
 # ---------------------------------------------------------------------------
