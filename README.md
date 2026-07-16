@@ -1,8 +1,20 @@
-# Distributed Key-Value Store
+# Distributed KV Store
+
+![CI](https://github.com/Ajayvardhanreddy/distributed-kv-store/actions/workflows/ci.yml/badge.svg) ![python](https://img.shields.io/badge/python-3.13%2B-blue) ![tests](https://img.shields.io/badge/tests-94%20passing-brightgreen) ![package manager](https://img.shields.io/badge/package%20manager-uv-7c3aed)
 
 A fault-tolerant, distributed in-memory key-value store built from scratch in Python — no etcd, no ZooKeeper, no external consensus library. Implements consistent hashing, synchronous replication, automatic leader failover, binary WAL durability, tombstone deletes, TTL expiry, and compare-and-swap — validated with 12 real-server chaos tests.
 
 > **[System Design →](DESIGN.md)** · **[Architecture Decisions →](docs/decisions/)**
+
+---
+
+**Part of a 3-layer AI infrastructure portfolio.** This is **Layer 1** — the storage foundation that powers the full agent stack above it.
+
+| Layer | Repo | What it does |
+|-------|------|--------------|
+| **Layer 1 — this repo** | [distributed-kv-store](https://github.com/Ajayvardhanreddy/distributed-kv-store) | Fault-tolerant distributed KV storage with consistent hashing and node failover |
+| Layer 2 | [agent-memory-service](https://github.com/Ajayvardhanreddy/agent-memory-service) | Multi-namespace memory service (session, user, working, audit) backed by Layer 1 |
+| Layer 3 | [agent-execution-engine](https://github.com/Ajayvardhanreddy/agent-execution-engine) | Agent runtime — orchestration, tool execution, memory, observability, evals, MCP |
 
 ---
 
