@@ -193,7 +193,7 @@ sequenceDiagram
 
     alt DURABILITY=strict (default)
         App->>WAL: append(PUT, key, value, ver)
-        WAL->>Disk: write JSON line + flush
+        WAL->>Disk: write CRC32-framed msgpack record + flush
         Disk-->>WAL: ack
         WAL-->>App: done (synchronous)
     else DURABILITY=relaxed
@@ -244,9 +244,13 @@ graph LR
 
 | ADR | Decision | Trade-off |
 |-----|----------|-----------|
-| [001](docs/decisions/001-ap-over-cp.md) | AP over CP | Availability over strict consistency |
-| [002](docs/decisions/002-consistent-hashing.md) | Consistent hashing | Uniform distribution vs ring complexity |
-| [003](docs/decisions/003-wal-json-lines.md) | JSON-lines WAL | Human-readable vs binary efficiency |
-| [004](docs/decisions/004-synchronous-replication.md) | Synchronous replication | Consistency vs write latency |
-| [005](docs/decisions/005-single-leader-writes.md) | Single-leader writes | Simplicity vs multi-master throughput |
-| [006](docs/decisions/006-batched-wal-durability.md) | Batched WAL | Throughput vs bounded data loss |
+| [001](docs/decisions/001-consistent-hashing-over-modulo.md) | Consistent hashing over modulo | 2.8× fewer keys moved on scale-out |
+| [002](docs/decisions/002-synchronous-vs-async-replication.md) | Synchronous replication | No data-loss window vs higher write latency |
+| [003](docs/decisions/003-why-not-raft.md) | Ring-based leader election, not Raft | Instant failover vs ~5s split-brain window |
+| [004](docs/decisions/004-ap-over-cp.md) | AP over CP | Always available vs linearizable |
+| [005](docs/decisions/005-wal-before-memory.md) | WAL before memory | Crash safety — no silent data loss |
+| [006](docs/decisions/006-batched-wal-durability.md) | Strict vs relaxed durability | 0 data loss vs ~5–10× PUT throughput |
+| [007](docs/decisions/007-binary-wal-crc.md) | Binary WAL with CRC32 + msgpack | Integrity + schema versioning vs human-readable |
+| [008](docs/decisions/008-tombstone-delete-model.md) | Tombstone deletes | Prevents key resurrection vs store memory growth |
+| [009](docs/decisions/009-ttl-expiration.md) | Lazy expiry + active sweeper | Read-path free of side-effects vs expiry lag |
+| [010](docs/decisions/010-cas-conditional-writes.md) | CAS with opaque version tokens | Optimistic locking vs not linearizable under split-brain |
