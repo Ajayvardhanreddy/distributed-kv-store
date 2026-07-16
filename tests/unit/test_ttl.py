@@ -11,16 +11,13 @@ Spec contract:
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import time
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.storage.engine import StorageEngine
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -219,7 +216,8 @@ async def test_replicas_expire_identically():
 
         await leader.close()
         await replica.close()
-        import shutil; shutil.rmtree(replica_dir)
+        import shutil
+        shutil.rmtree(replica_dir)
 
 
 # ---------------------------------------------------------------------------

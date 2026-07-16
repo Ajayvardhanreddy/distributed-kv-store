@@ -3,9 +3,11 @@ Integration tests for data persistence.
 
 Tests that data survives across storage engine restarts.
 """
-import pytest
-import tempfile
 import os
+import tempfile
+
+import pytest
+
 from app.storage.engine import StorageEngine
 
 

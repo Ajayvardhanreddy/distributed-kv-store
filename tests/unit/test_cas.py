@@ -21,14 +21,12 @@ import tempfile
 import pytest
 from fastapi.testclient import TestClient
 
-import app.main as main_module
 from app.cluster.consistent_hash import ConsistentHashRing
 from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
+from app.main import app
 from app.storage.engine import StorageEngine
 from app.storage.version_token import decode_token, encode_token, version_matches
-from app.main import app
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -46,8 +44,8 @@ async def setup_single_node(monkeypatch):
         await storage.initialize()
         r = ClusterRouter(cfg, storage, ring)
         await r.initialize()
-        main_module.config = cfg
-        main_module.router = r
+        app.state.config = cfg
+        app.state.router = r
         yield
         await r.close()
         await storage.close()

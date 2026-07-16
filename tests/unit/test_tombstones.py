@@ -11,13 +11,12 @@ after tombstone_expires_at. Tests cover:
   - PUT after DELETE creates a fresh live entry (reuse key)
 """
 import os
-import time
 import tempfile
+import time
 
 import pytest
 
 from app.storage.engine import StorageEngine
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -158,8 +157,8 @@ async def test_tombstone_survives_wal_replay():
 async def test_tombstone_version_increments_on_delete():
     with tempfile.TemporaryDirectory() as tmp:
         engine = await _make_engine(tmp)
-        v1 = await engine.put("k", "a")   # version 1
-        v2 = await engine.put("k", "b")   # version 2
+        await engine.put("k", "a")   # version 1
+        await engine.put("k", "b")   # version 2
         await engine.delete("k")          # tombstone at version 3
 
         entry = engine.store["k"]

@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.cluster.consistent_hash import ConsistentHashRing
@@ -37,13 +37,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Globals (initialised in lifespan)
-# ---------------------------------------------------------------------------
-config: NodeConfig = None
-router: ClusterRouter = None
-health: HealthChecker = None
 
 # Background task intervals
 _COMPACT_INTERVAL_SECONDS = 300.0   # 5 minutes
@@ -100,8 +93,6 @@ async def _sweeper_loop(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global config, router, health
-
     config = NodeConfig()
 
     ring = ConsistentHashRing(num_vnodes=150)
@@ -123,11 +114,15 @@ async def lifespan(app: FastAPI):
         f"rf={config.replication_factor} | live_keys={live}"
     )
 
-    health = HealthChecker(config)
+    health = HealthChecker(config, check_interval=config.health_check_interval)
     await health.start()
 
     router = ClusterRouter(config, storage, ring, health=health)
     await router.initialize()
+
+    app.state.config = config
+    app.state.router = router
+    app.state.health = health
 
     await sync_from_peers(config, storage)
 
@@ -244,11 +239,14 @@ except ImportError:
     logger.warning("prometheus-fastapi-instrumentator not installed — /metrics disabled")
 
 try:
-    from prometheus_client import Counter, Gauge
-    _tombstones_compacted = Counter(
-        "tombstones_compacted_total",
-        "Tombstones physically removed by the compaction loop",
-    )
+    from prometheus_client import REGISTRY, Counter
+    try:
+        _tombstones_compacted = Counter(
+            "tombstones_compacted_total",
+            "Tombstones physically removed by the compaction loop",
+        )
+    except ValueError:
+        _tombstones_compacted = REGISTRY._names_to_collectors["tombstones_compacted_total"]
 except ImportError:
     class _Stub:
         def inc(self, n=1): pass
@@ -280,18 +278,21 @@ class TombstoneRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health_check():
+async def health_check(req: Request):
+    _config = req.app.state.config
+    _router = req.app.state.router
     return {
         "status": "healthy",
-        "node_id": config.node_id,
-        "local_keys": await router.local_size(),
+        "node_id": _config.node_id,
+        "local_keys": await _router.local_size(),
     }
 
 
 @app.get("/kv/{key}")
-async def get_value(key: str):
+async def get_value(key: str, req: Request):
+    _router = req.app.state.router
     try:
-        value, version = await router.get(key)
+        value, version = await _router.get(key)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -299,14 +300,14 @@ async def get_value(key: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
                             detail=f"Key '{key}' not found")
     logger.info(f"GET '{key}' ver={version}")
-    # Phase 4: return opaque version_token only (raw int deprecated)
     return {"value": value, "version_token": encode_token(version)}
 
 
 @app.put("/kv/{key}")
-async def put_value(key: str, request: KeyValue):
+async def put_value(key: str, request: KeyValue, req: Request):
+    _router = req.app.state.router
     try:
-        version = await router.put(
+        version = await _router.put(
             key, request.value,
             ttl_seconds=request.ttl_seconds,
             if_match=request.if_match,
@@ -325,9 +326,10 @@ async def put_value(key: str, request: KeyValue):
 
 
 @app.delete("/kv/{key}")
-async def delete_value(key: str, if_match: Optional[str] = None):
+async def delete_value(key: str, req: Request, if_match: Optional[str] = None):
+    _router = req.app.state.router
     try:
-        deleted = await router.delete(key, if_match=if_match)
+        deleted = await _router.delete(key, if_match=if_match)
     except CASConflictError as e:
         raise HTTPException(
             status_code=409,
@@ -348,33 +350,33 @@ async def delete_value(key: str, if_match: Optional[str] = None):
 # ---------------------------------------------------------------------------
 
 @app.get("/internal/kv/{key}")
-async def internal_get(key: str):
+async def internal_get(key: str, req: Request):
     """Internal GET — reads directly from local storage."""
-    value, version = await router.storage.get(key)
+    _storage = req.app.state.router.storage
+    value, version = await _storage.get(key)
     if value is None:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
     return {"value": value, "version": version}
 
 
 @app.put("/internal/kv/{key}")
-async def internal_put(key: str, request: KeyValue):
+async def internal_put(key: str, request: KeyValue, req: Request):
     """
     Internal PUT — writes directly to local storage (leader or replica path).
 
     version set     → replica fan-out: put_versioned, no CAS check
     version absent  → leader path: CAS check if if_match / if_none_match present
     """
+    _storage = req.app.state.router.storage
     if request.version is not None:
-        # Replica path — apply the leader's version, no CAS
-        await router.storage.put_versioned(
+        await _storage.put_versioned(
             key, request.value, request.version, expires_at=request.expires_at
         )
         return {"message": "success", "key": key, "version": request.version}
 
-    # Leader path — apply CAS if requested
     if request.if_match is not None or request.if_none_match:
-        _, current_ver = await router.storage.get(key)
-        raw_entry = router.storage.store.get(key)
+        _, current_ver = await _storage.get(key)
+        raw_entry = _storage.store.get(key)
         key_present = raw_entry is not None
         if request.if_none_match and key_present:
             from app.storage.version_token import encode_token as _enc
@@ -388,25 +390,24 @@ async def internal_put(key: str, request: KeyValue):
                 detail={"message": "version mismatch", "current_token": encode_token(current_ver)},
             )
 
-    version = await router.storage.put(
-        key, request.value, expires_at=request.expires_at
-    )
+    version = await _storage.put(key, request.value, expires_at=request.expires_at)
     return {"message": "success", "key": key, "version": version}
 
 
 @app.delete("/internal/kv/{key}")
-async def internal_delete(key: str):
+async def internal_delete(key: str, req: Request):
     """
     Internal DELETE — writes a tombstone to local storage (leader path).
 
     Returns version and tombstone_expires_at so the calling router can
     fan-out the exact same tombstone to replicas.
     """
-    deleted = await router.storage.delete(key)
+    _storage = req.app.state.router.storage
+    deleted = await _storage.delete(key)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
 
-    entry = router.storage.store.get(key, {})
+    entry = _storage.store.get(key, {})
     return {
         "message": "deleted",
         "key": key,
@@ -416,29 +417,30 @@ async def internal_delete(key: str):
 
 
 @app.post("/internal/tombstone/{key}")
-async def internal_tombstone(key: str, request: TombstoneRequest):
+async def internal_tombstone(key: str, request: TombstoneRequest, req: Request):
     """
     Apply a tombstone received from the write-leader (replica fan-out path).
 
     The version and tombstone_expires_at come from the leader so all replicas
     store identical tombstones.
     """
-    await router.storage.put_tombstone(
-        key, request.version, request.tombstone_expires_at
-    )
+    _storage = req.app.state.router.storage
+    await _storage.put_tombstone(key, request.version, request.tombstone_expires_at)
     return {"message": "tombstone applied", "key": key, "version": request.version}
 
 
 @app.get("/internal/sync")
-async def internal_sync():
+async def internal_sync(req: Request):
     """
     Anti-entropy endpoint — returns full local snapshot including tombstones.
 
     Tombstones are included so rejoining peers can learn about deletions and
     cannot resurrect keys that were removed while they were offline.
     """
-    snapshot = await router.storage.snapshot()
-    return {"node_id": config.node_id, "keys": snapshot}
+    _router = req.app.state.router
+    _config = req.app.state.config
+    snapshot = await _router.storage.snapshot()
+    return {"node_id": _config.node_id, "keys": snapshot}
 
 
 # ---------------------------------------------------------------------------
@@ -446,40 +448,47 @@ async def internal_sync():
 # ---------------------------------------------------------------------------
 
 @app.get("/cluster/health")
-async def cluster_health():
-    health_map = health.get_status()
+async def cluster_health(req: Request):
+    _config = req.app.state.config
+    _router = req.app.state.router
+    _health = req.app.state.health
+    health_map = _health.get_status()
     results: dict = {}
     for node_id, is_up in health_map.items():
-        if config.is_local(node_id):
+        if _config.is_local(node_id):
             results[node_id] = {
                 "status": "healthy",
                 "node_id": node_id,
-                "local_keys": await router.local_size(),
-                "replication_factor": config.replication_factor,
+                "local_keys": await _router.local_size(),
+                "replication_factor": _config.replication_factor,
             }
         else:
             results[node_id] = {"status": "healthy" if is_up else "unreachable"}
-    return {"cluster": results, "replication_factor": config.replication_factor}
+    return {"cluster": results, "replication_factor": _config.replication_factor}
 
 
 @app.get("/stats")
-async def get_stats():
+async def get_stats(req: Request):
+    _config = req.app.state.config
+    _router = req.app.state.router
+    _health = req.app.state.health
     return {
-        "node_id": config.node_id,
+        "node_id": _config.node_id,
         "version": "0.9.0",
-        "local_keys": await router.local_size(),
-        "replication_factor": config.replication_factor,
-        "peers": config.node_ids,
-        "peer_health": health.get_status(),
+        "local_keys": await _router.local_size(),
+        "replication_factor": _config.replication_factor,
+        "peers": _config.node_ids,
+        "peer_health": _health.get_status(),
     }
 
 
 @app.get("/")
-async def root():
+async def root(req: Request):
+    _config = getattr(req.app.state, "config", None)
     return {
         "service": "Distributed KV Store",
         "version": "0.9.0",
-        "node_id": config.node_id if config else "unknown",
+        "node_id": _config.node_id if _config else "unknown",
         "endpoints": {
             "health": "/health",
             "cluster_health": "/cluster/health",

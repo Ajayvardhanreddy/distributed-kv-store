@@ -12,8 +12,8 @@ Environment variables:
     REPLICATION_FACTOR - How many nodes each key is written to (default 2)
     DATA_DIR           - Directory for WAL files (default "data")
 """
-import os
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,11 @@ class NodeConfig:
         # 24h default — long enough for all replicas to learn about the delete.
         self.tombstone_retention_seconds: float = float(
             os.getenv("TOMBSTONE_RETENTION_SECONDS", "86400")
+        )
+
+        # Background health-check ping interval (seconds).
+        self.health_check_interval: float = float(
+            os.getenv("HEALTH_CHECK_INTERVAL", "5.0")
         )
 
         logger.info(

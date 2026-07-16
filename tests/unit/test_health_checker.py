@@ -28,7 +28,6 @@ from app.cluster.node_config import NodeConfig
 from app.cluster.router import ClusterRouter
 from app.storage.engine import StorageEngine
 
-
 # -----------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------
@@ -167,7 +166,8 @@ async def test_get_reads_primary_when_healthy(monkeypatch):
         value, version = await router.get("key")
         assert value == "value"
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -203,7 +203,8 @@ async def test_get_falls_back_to_replica_when_primary_down(monkeypatch):
         # Was called with the REPLICA, not the (skipped) primary
         router._forward_get.assert_awaited_once_with(replica, remote_key)
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -232,7 +233,8 @@ async def test_get_raises_when_all_replicas_down(monkeypatch):
         with pytest.raises(RuntimeError, match="All replicas unreachable"):
             await router.get(fully_remote_key)
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -266,5 +268,6 @@ async def test_get_marks_down_immediately_on_network_error(monkeypatch):
         # node-1 must be marked down after the error
         assert hc.is_healthy("node-1") is False
 
-        await router.close(); await storage.close()
+        await router.close()
+        await storage.close()
 

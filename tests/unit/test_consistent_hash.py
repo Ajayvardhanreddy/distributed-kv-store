@@ -3,7 +3,6 @@ Unit tests for ConsistentHashRing
 
 Tests the consistent hashing algorithm and virtual node distribution.
 """
-import pytest
 from app.cluster.consistent_hash import ConsistentHashRing
 
 

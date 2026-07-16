@@ -16,8 +16,6 @@ import tempfile
 import pytest
 
 from app.storage.engine import StorageEngine
-from app.storage.wal import WriteAheadLog
-
 
 # -----------------------------------------------------------------------
 # Version counter behaviour
@@ -209,7 +207,6 @@ async def test_lower_version_loses_in_sync():
 @pytest.mark.asyncio
 async def test_relaxed_wal_buffers_and_flushes():
     """In relaxed mode, writes buffer; after close() they persist on disk."""
-    import asyncio
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "relaxed.wal")
         engine = StorageEngine(path, durability="relaxed")
